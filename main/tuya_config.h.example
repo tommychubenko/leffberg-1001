@@ -1,0 +1,15 @@
+#ifndef TUYA_CONFIG_H_
+#define TUYA_CONFIG_H_
+
+/* Copy to tuya_config.h and fill in values from Tuya Developer Platform. */
+#define TUYA_PRODUCT_ID  "your_product_id"
+#define TUYA_DEVICE_UUID "your_device_uuid_16_or_20_chars"
+#define TUYA_AUTH_KEY    "your_auth_key_32_chars"
+
+#define TUYA_PRODUCT_KEY    TUYA_PRODUCT_ID
+#define TUYA_DEVICE_AUTHKEY TUYA_AUTH_KEY
+
+#define TUYA_CLIENT_ID     "your_cloud_client_id"
+#define TUYA_CLIENT_SECRET "your_cloud_client_secret"
+
+#endif

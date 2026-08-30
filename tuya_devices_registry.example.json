@@ -1,0 +1,11 @@
+{
+  "product_id": "py2y0a6swupwndbr",
+  "devices": [
+    {
+      "chip_mac": "AA:BB:CC:DD:EE:FF",
+      "device_id": "YOUR_DEVICE_UUID",
+      "device_secret": "YOUR_DEVICE_AUTHKEY",
+      "hardware_name": "ESP32-S3-N16R8 #1"
+    }
+  ]
+}

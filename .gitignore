@@ -1,0 +1,21 @@
+# Local secrets / device licenses (do not commit)
+tuya_devices_registry.json
+main/tuya_config.h
+
+# Reference clones (not part of firmware)
+components/_ref_tuya_ble_sdk/
+
+# ESP-IDF / build
+build/
+sdkconfig
+sdkconfig.old
+managed_components/
+dependencies.lock
+
+# IDE / OS
+.vscode/
+.idea/
+*.pyc
+__pycache__/
+.DS_Store
+Thumbs.db
