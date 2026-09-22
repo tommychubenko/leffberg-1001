@@ -24,3 +24,8 @@ Thumbs.db
 tuyaopen-handoff/secrets.local.md
 *.local.md
 
+# local machine / build artifacts
+eim_config.toml
+*.bin
+ESP32_S3_Speaker_FW.bin
+

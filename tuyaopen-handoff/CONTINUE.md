@@ -3,12 +3,16 @@
 ## Стан (2026-09-22)
 
 - **Плата:** ESP32-S3-N16R8 (підтверджено на модулі)
-- **COM:** раніше був `COM4` (CH343), правий USB‑C порт
+- **COM:** `COM4` (CH343), правий USB‑C порт
 - **Проєкт SDK:** [TuyaOpen](https://github.com/tuya/TuyaOpen) → app `apps/tuya.ai/your_chat_bot`
 - **Board config:** `ESP32S3_BREAD_COMPACT_WIFI`
 - **PID:** `19j7q577p8ljcajg`
-- **UUID / AuthKey:** НЕ в цьому репо (публічне). Візьміть з Excel ліцензій Tuya або з локального файлу `secrets.local.md` (не комітити).
-- **Збірка на цьому ПК:** не завершена — Windows WDAC блокує pip-`cmake`; є fallback-патч під Espressif cmake.
+- **UUID / AuthKey:** НЕ в цьому публічному репо. Візьміть з Excel ліцензій Tuya або з `secrets.local.md` / приватного [leffberg-ai-speaker](https://github.com/tommychubenko/leffberg-ai-speaker).
+- **Збірка / прошивка:** OK (cmake fallback на Espressif; flash 115200; OLED вимкнено — без SSD1306 не падає)
+- **Smart Life:** спарено (SoftAP)
+- **AI Agent:** `Leffberg AI agent` (Central Europe, Standard/Custom) прив’язаний до PID
+- **Billing:** продукт у **Subscription Service Plan** → AI платить кінцевий користувач; developer Credits waived
+- **Ще TODO:** паяти mic/amp/speaker і перевірити голос; wake word у firmware config
 
 ## Ліцензії Tuya (2 шт.)
 
