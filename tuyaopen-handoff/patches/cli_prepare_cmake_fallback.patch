@@ -1,0 +1,51 @@
+﻿diff --git a/tools/cli_command/cli_prepare.py b/tools/cli_command/cli_prepare.py
+index aa32a944..d132a35e 100644
+--- a/tools/cli_command/cli_prepare.py
++++ b/tools/cli_command/cli_prepare.py
+@@ -277,6 +277,21 @@ def resolve_venv_tool(binary: str) -> Optional[str]:
+     return shutil.which(binary, path=scripts)
+ 
+ 
++def _espressif_cmake_exe() -> Optional[str]:
++    """Windows fallback when the pip cmake launcher is blocked by WDAC/Smart App Control."""
++    if sys.platform != "win32":
++        return None
++    candidates = [
++        os.environ.get("OPEN_SDK_CMAKE"),
++        r"C:\Espressif\tools\cmake\3.30.2\bin\cmake.exe",
++        os.path.expandvars(r"%USERPROFILE%\cmake\bin\cmake.exe"),
++    ]
++    for path in candidates:
++        if path and os.path.isfile(path) and _tool_runs_ok(path):
++            return path
++    return None
++
++
+ def ensure_venv_tool(pkg: str, binary: str) -> Tuple[bool, Optional[str]]:
+     """Ensure a venv-managed tool exists and actually runs; repair if not.
+ 
+@@ -308,6 +323,13 @@ def ensure_venv_tool(pkg: str, binary: str) -> Tuple[bool, Optional[str]]:
+             logger.note(f"[{binary}] repaired.")
+             return True, exe
+ 
++    if binary == "cmake":
++        esp = _espressif_cmake_exe()
++        if esp:
++            logger.note(f"[cmake] using fallback: {esp}")
++            _prepend_to_path(os.path.dirname(esp))
++            return True, esp
++
+     return False, exe
+ 
+ 
+@@ -348,6 +370,10 @@ def ensure_build_env() -> bool:
+     if not ensure_build_tools():
+         return False
+     prepend_venv_scripts_to_path()
++    # Prefer a working Espressif cmake over a WDAC-blocked pip launcher in Scripts.
++    esp = _espressif_cmake_exe()
++    if esp:
++        _prepend_to_path(os.path.dirname(esp))
+     return True
+ 
+ 

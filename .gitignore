@@ -19,3 +19,8 @@ dependencies.lock
 __pycache__/
 .DS_Store
 Thumbs.db
+
+# local Tuya secrets
+tuyaopen-handoff/secrets.local.md
+*.local.md
+

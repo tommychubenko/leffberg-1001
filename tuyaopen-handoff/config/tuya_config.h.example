@@ -1,0 +1,9 @@
+﻿#ifndef TUYA_CONFIG_H_
+#define TUYA_CONFIG_H_
+#include "tuya_cloud_types.h"
+#ifndef TUYA_PRODUCT_ID
+#define TUYA_PRODUCT_ID "19j7q577p8ljcajg"
+#endif
+#define TUYA_OPENSDK_UUID    "YOUR_UUID_HERE"
+#define TUYA_OPENSDK_AUTHKEY "YOUR_AUTHKEY_HERE"
+#endif
