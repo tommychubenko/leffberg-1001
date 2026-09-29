@@ -1,0 +1,31 @@
+diff --git a/tuya_open_sdk/tuyaos_adapter/src/drivers/tkl_i2s.c b/tuya_open_sdk/tuyaos_adapter/src/drivers/tkl_i2s.c
+index 8b2497e..ce2294b 100755
+--- a/tuya_open_sdk/tuyaos_adapter/src/drivers/tkl_i2s.c
++++ b/tuya_open_sdk/tuyaos_adapter/src/drivers/tkl_i2s.c
+@@ -169,6 +169,26 @@ OPERATE_RET tkl_i2s_init(TUYA_I2S_NUM_E i2s_num, const TUYA_I2S_BASE_CFG_T *i2s_
+         }
+     };
+ 
++    /*
++     * Speaker-only port (I2S1 → MAX98357). Use classic 16-bit Philips stereo
++     * with L=R. 32-bit expand path only produced SD-gated Class-D squeal on
++     * this breadboard; MAX98357 examples are almost always 16-bit I2S.
++     */
++    if (i2s_tx_hdl && !i2s_rx_hdl) {
++        std_cfg.slot_cfg.data_bit_width = I2S_DATA_BIT_WIDTH_16BIT;
++        std_cfg.slot_cfg.slot_bit_width = I2S_SLOT_BIT_WIDTH_16BIT;
++        std_cfg.slot_cfg.slot_mode = I2S_SLOT_MODE_STEREO;
++        std_cfg.slot_cfg.slot_mask = I2S_STD_SLOT_BOTH;
++        std_cfg.slot_cfg.ws_width = I2S_DATA_BIT_WIDTH_16BIT;
++        std_cfg.slot_cfg.bit_shift = true;
++#ifdef I2S_HW_VERSION_2
++        std_cfg.slot_cfg.left_align = false;
++        std_cfg.slot_cfg.big_endian = false;
++        std_cfg.slot_cfg.bit_order_lsb = false;
++#endif
++        ESP_LOGI(TAG, "TX Philips 16-bit stereo (L=R) for MAX98357");
++    }
++
+     if (i2s_tx_hdl) {
+         esp_rt = i2s_channel_init_std_mode(*i2s_tx_hdl, &std_cfg);
+         if (esp_rt != ESP_OK) {

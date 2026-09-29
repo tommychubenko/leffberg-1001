@@ -1,0 +1,1141 @@
+diff --git a/apps/tuya.ai/your_chat_bot/app_default.config b/apps/tuya.ai/your_chat_bot/app_default.config
+index 97b42e29..c092b559 100644
+--- a/apps/tuya.ai/your_chat_bot/app_default.config
++++ b/apps/tuya.ai/your_chat_bot/app_default.config
+@@ -1,9 +1,7 @@
+ CONFIG_PROJECT_VERSION="1.0.1"
+-CONFIG_TUYA_PRODUCT_ID="alon7qgyjj8yus74"
++CONFIG_TUYA_PRODUCT_ID="19j7q577p8ljcajg"
++CONFIG_ENABLE_AI_CHAT_GUI_OLED=y
++CONFIG_AI_CHAT_GUI_OLED_SIZE_128_32=y
+ CONFIG_BUTTON_NAME="ai_chat_button"
+-CONFIG_BOARD_CHOICE_T5AI=y
+-CONFIG_BOARD_CHOICE_ZECTRIX_T5AI_NOTE_4=y
+-CONFIG_ENABLE_MBEDTLS_SSL_MAX_CONTENT_LEN=4096
+-CONFIG_ENABLE_APP_LOWPOWER=y
+-CONFIG_APP_LOWPOWER_AP_KEEPALIVE=y
+-CONFIG_APP_LOWPOWER_IDLE_TIME_S=30
++CONFIG_BOARD_CHOICE_ESP32=y
++CONFIG_BOARD_CHOICE_BREAD_COMPACT_WIFI=y
+diff --git a/apps/tuya.ai/your_chat_bot/config/ESP32S3_BREAD_COMPACT_WIFI.config b/apps/tuya.ai/your_chat_bot/config/ESP32S3_BREAD_COMPACT_WIFI.config
+index b56104c8..c092b559 100644
+--- a/apps/tuya.ai/your_chat_bot/config/ESP32S3_BREAD_COMPACT_WIFI.config
++++ b/apps/tuya.ai/your_chat_bot/config/ESP32S3_BREAD_COMPACT_WIFI.config
+@@ -1,5 +1,5 @@
+ CONFIG_PROJECT_VERSION="1.0.1"
+-CONFIG_TUYA_PRODUCT_ID="j1y437proohznfbs"
++CONFIG_TUYA_PRODUCT_ID="19j7q577p8ljcajg"
+ CONFIG_ENABLE_AI_CHAT_GUI_OLED=y
+ CONFIG_AI_CHAT_GUI_OLED_SIZE_128_32=y
+ CONFIG_BUTTON_NAME="ai_chat_button"
+diff --git a/apps/tuya.ai/your_chat_bot/src/app_chat_bot.c b/apps/tuya.ai/your_chat_bot/src/app_chat_bot.c
+index 1d611ecd..73ec3202 100644
+--- a/apps/tuya.ai/your_chat_bot/src/app_chat_bot.c
++++ b/apps/tuya.ai/your_chat_bot/src/app_chat_bot.c
+@@ -142,7 +142,7 @@ OPERATE_RET app_chat_bot_init(void)
+ 
+     AI_CHAT_MODE_CFG_T ai_chat_cfg = {
+         .default_mode = AI_CHAT_MODE_HOLD, // push-to-talk; idle low-power gates on this mode
+-        .default_vol  = 70,
++        .default_vol  = 50,
+         .evt_cb       = __ai_chat_handle_event,
+     };
+     TUYA_CALL_ERR_RETURN(ai_chat_init(&ai_chat_cfg));
+diff --git a/apps/tuya.ai/your_chat_bot/src/tuya_main.c b/apps/tuya.ai/your_chat_bot/src/tuya_main.c
+index e1d03f63..5d6207f8 100644
+--- a/apps/tuya.ai/your_chat_bot/src/tuya_main.c
++++ b/apps/tuya.ai/your_chat_bot/src/tuya_main.c
+@@ -68,7 +68,11 @@ tuya_iot_license_t license;
+ #define PROJECT_VERSION "1.0.0"
+ #endif
+ 
+-#define DPID_VOLUME 3
++/* Product Advanced DPs: voice_vol=203, voice_mic=204, voice_play=205 (not legacy demo DP 3) */
++#define DPID_VOLUME       203
++#define DPID_VOICE_MIC    204
++#define DPID_VOICE_PLAY   205
++#define DEFAULT_VOICE_VOL 50
+ 
+ /**
+  * @brief user defined log output api, in this demo, it will use uart0 as log-tx
+@@ -123,7 +127,7 @@ OPERATE_RET audio_dp_obj_proc(dp_obj_recv_t *dpobj)
+         switch (dp->id) {
+         case DPID_VOLUME: {
+             uint8_t volume = dp->value.dp_value;
+-            PR_DEBUG("volume:%d", volume);
++            PR_DEBUG("voice_vol (dp %d):%d", DPID_VOLUME, volume);
+             ai_chat_set_volume(volume);
+ #if defined(ENABLE_CHAT_DISPLAY) && (ENABLE_CHAT_DISPLAY == 1)
+             char volume_str[20] = {0};
+@@ -132,6 +136,14 @@ OPERATE_RET audio_dp_obj_proc(dp_obj_recv_t *dpobj)
+ #endif
+             break;
+         }
++        case DPID_VOICE_MIC: {
++            PR_DEBUG("voice_mic (dp %d):%d", DPID_VOICE_MIC, (int)dp->value.dp_bool);
++            break;
++        }
++        case DPID_VOICE_PLAY: {
++            PR_DEBUG("voice_play (dp %d):%d", DPID_VOICE_PLAY, (int)dp->value.dp_bool);
++            break;
++        }
+         default:
+             break;
+         }
+@@ -143,17 +155,26 @@ OPERATE_RET audio_dp_obj_proc(dp_obj_recv_t *dpobj)
+ OPERATE_RET ai_audio_volume_upload(void)
+ {
+     tuya_iot_client_t *client = tuya_iot_client_get();
+-    dp_obj_t           dp_obj = {0};
++    dp_obj_t           dps[3] = {0};
+ 
+     uint8_t volume = ai_chat_get_volume();
+ 
+-    dp_obj.id             = DPID_VOLUME;
+-    dp_obj.type           = PROP_VALUE;
+-    dp_obj.value.dp_value = volume;
++    dps[0].id             = DPID_VOLUME;
++    dps[0].type           = PROP_VALUE;
++    dps[0].value.dp_value = volume;
++
++    dps[1].id            = DPID_VOICE_MIC;
++    dps[1].type          = PROP_BOOL;
++    dps[1].value.dp_bool = true;
++
++    dps[2].id            = DPID_VOICE_PLAY;
++    dps[2].type          = PROP_BOOL;
++    dps[2].value.dp_bool = true;
+ 
+-    PR_DEBUG("DP upload volume:%d", volume);
++    PR_DEBUG("DP upload voice_vol(%d)=%d voice_mic(%d)=true voice_play(%d)=true", DPID_VOLUME, volume,
++             DPID_VOICE_MIC, DPID_VOICE_PLAY);
+ 
+-    return tuya_iot_dp_obj_report(client, client->activate.devid, &dp_obj, 1, 0);
++    return tuya_iot_dp_obj_report(client, client->activate.devid, dps, 3, 0);
+ }
+ 
+ /**
+@@ -213,6 +234,8 @@ void user_event_handler_on(tuya_iot_client_t *client, tuya_event_msg_t *event)
+             UI_WIFI_STATUS_E wifi_status = UI_WIFI_STATUS_GOOD;
+             ai_ui_disp_msg(AI_UI_DISP_NETWORK, (uint8_t *)&wifi_status, sizeof(UI_WIFI_STATUS_E));
+ #endif
++            /* Product defaults: voice_vol=50, voice_mic=ON, voice_play=ON */
++            ai_chat_set_volume(DEFAULT_VOICE_VOL);
+             ai_audio_volume_upload();
+         }
+         app_chat_bot_set_online(TRUE); // cloud online -> AP associated, allow ULP descent
+diff --git a/boards/ESP32/ESP32S3_BREAD_COMPACT_WIFI/esp32s3_bread_compact_wifi.c b/boards/ESP32/ESP32S3_BREAD_COMPACT_WIFI/esp32s3_bread_compact_wifi.c
+index 00b46ae0..ea9134e6 100755
+--- a/boards/ESP32/ESP32S3_BREAD_COMPACT_WIFI/esp32s3_bread_compact_wifi.c
++++ b/boards/ESP32/ESP32S3_BREAD_COMPACT_WIFI/esp32s3_bread_compact_wifi.c
+@@ -79,6 +79,8 @@ static OPERATE_RET __board_register_audio(void)
+     cfg.i2s_id = 0;
+     cfg.mic_sample_rate = 16000;
+     cfg.spk_sample_rate = 16000;
++    /* MAX98357 SD → GPIO17 (not 3V3): mute in idle, unmute only while TTS plays */
++    cfg.spk_sd_pin = TUYA_GPIO_NUM_17;
+ 
+     TUYA_CALL_ERR_RETURN(tdd_audio_no_codec_register(AUDIO_CODEC_NAME, cfg));
+ #endif
+@@ -130,6 +132,7 @@ OPERATE_RET board_register_hardware(void)
+     TUYA_CALL_ERR_LOG(__board_register_button());
+ 
+     TUYA_CALL_ERR_LOG(__board_register_audio());
++    /* OLED optional: without a panel, SSD1306 init hits ESP_ERROR_CHECK and reboots. */
+     TUYA_CALL_ERR_LOG(board_display_init());
+ 
+     return rt;
+@@ -137,6 +140,7 @@ OPERATE_RET board_register_hardware(void)
+ 
+ int board_display_init(void)
+ {
++#if defined(BOARD_ENABLE_SSD1306_OLED) && (BOARD_ENABLE_SSD1306_OLED == 1)
+     TDD_DISP_ESP_LCD_CFG_T cfg = {
+         .width     = DISPLAY_WIDTH,
+         .height    = DISPLAY_HEIGHT,
+@@ -155,4 +159,8 @@ int board_display_init(void)
+     };
+ 
+     return tdd_disp_esp_ssd1306_register(DISPLAY_NAME, &hw, &cfg);
++#else
++    PR_NOTICE("SSD1306 OLED disabled (no display hardware)");
++    return OPRT_OK;
++#endif
+ }
+diff --git a/boards/ESP32/common/audio/tdd_audio_no_codec.c b/boards/ESP32/common/audio/tdd_audio_no_codec.c
+index fe13473b..64c4a02b 100644
+--- a/boards/ESP32/common/audio/tdd_audio_no_codec.c
++++ b/boards/ESP32/common/audio/tdd_audio_no_codec.c
+@@ -5,6 +5,7 @@
+  * @date 2025-04-08
+  */
+ #include "math.h"
++#include "string.h"
+ 
+ #include "tdl_audio_driver.h"
+ #include "tdd_audio_no_codec.h"
+@@ -14,8 +15,10 @@
+ #include "tal_system.h"
+ #include "tal_thread.h"
+ #include "tal_mutex.h"
++#include "tal_sw_timer.h"
+ 
+ #include "tkl_i2s.h"
++#include "tkl_gpio.h"
+ 
+ #include "audio_afe.h"
+ 
+@@ -25,6 +28,23 @@
+ // I2S read time default is 10ms
+ #define I2S_READ_TIME_MS (10)
+ #define SAMPLE_DATABITS  (16)
++/* Remute MAX98357 shortly after last PCM chunk (idle BCLK otherwise squeals). */
++#define SPK_SD_MUTE_DELAY_MS (500)
++
++/* Continuous I2S amp self-test. Set 0 for normal TTS / dingdong. */
++#ifndef ENABLE_I2S_TONE_TEST
++#define ENABLE_I2S_TONE_TEST 0
++#endif
++
++/*
++ * Acoustic loopback diagnostics: while the speaker is unmuted, analyse what the
++ * on-board mic actually hears (100 ms windows) and log rms / zero-crossing rate /
++ * share of energy at the chime frequencies. Tells "what comes out of the speaker"
++ * without an oscilloscope. Set 0 once the audio path is trusted.
++ */
++#ifndef ENABLE_MIC_LOOPBACK_STATS
++#define ENABLE_MIC_LOOPBACK_STATS 1
++#endif
+ 
+ /***********************************************************
+ ***********************typedef define***********************
+@@ -38,8 +58,10 @@ typedef struct {
+ 
+     THREAD_HANDLE thrd_hdl;
+     MUTEX_HANDLE mutex_play;
++    TIMER_ID sd_mute_tm;
+ 
+     uint8_t play_volume;
++    volatile bool spk_on; /* mirrors SD pin */
+ 
+     // data buffer
+     uint8_t *raw_data_buf;
+@@ -61,6 +83,151 @@ typedef struct {
+ ***********************function define**********************
+ ***********************************************************/
+ 
++static void __spk_sd_set(ESP_I2S_HANDLE_T *hdl, bool enable)
++{
++    if (NULL == hdl || hdl->cfg.spk_sd_pin >= TUYA_GPIO_NUM_MAX) {
++        return;
++    }
++    hdl->spk_on = enable;
++    tkl_gpio_write(hdl->cfg.spk_sd_pin, enable ? TUYA_GPIO_LEVEL_HIGH : TUYA_GPIO_LEVEL_LOW);
++}
++
++#if ENABLE_MIC_LOOPBACK_STATS
++#define LB_WIN_SAMPLES (1600) /* 100 ms @ 16 kHz */
++#define LB_NUM_FREQ    (6)
++/* chime notes 659 / 523 Hz at 1x, 2x, 3x playback speed (rate-mismatch check) */
++static const float s_lb_freq[LB_NUM_FREQ] = {659.0f, 523.0f, 1318.0f, 1046.0f, 1977.0f, 1569.0f};
++
++/* Static state: the read task runs on a 1 KB-class stack. */
++static struct {
++    float coeff[LB_NUM_FREQ];
++    float s1[LB_NUM_FREQ], s2[LB_NUM_FREQ];
++    uint64_t sq;
++    int64_t sum_raw; /* for DC estimate */
++    int32_t raw_min, raw_max;
++    uint32_t zc;
++    uint32_t n;
++    float hp_x1, hp_y1; /* one-pole DC blocker state */
++    float prev;
++    uint8_t tail; /* keep logging a few windows after mute to catch the decay */
++    bool inited;
++} s_lb;
++
++static void __mic_loopback_feed(ESP_I2S_HANDLE_T *hdl, const int16_t *x, uint32_t n)
++{
++    if (!s_lb.inited) {
++        for (int k = 0; k < LB_NUM_FREQ; k++) {
++            s_lb.coeff[k] = 2.0f * cosf(2.0f * 3.14159265f * s_lb_freq[k] / 16000.0f);
++        }
++        s_lb.raw_min = INT32_MAX;
++        s_lb.raw_max = INT32_MIN;
++        s_lb.inited = true;
++    }
++
++    if (hdl->spk_on) {
++        s_lb.tail = 3;
++    } else if (s_lb.tail == 0) {
++        /* speaker idle: keep detectors reset, no logging */
++        s_lb.n = 0;
++        s_lb.sq = 0;
++        s_lb.sum_raw = 0;
++        s_lb.raw_min = INT32_MAX;
++        s_lb.raw_max = INT32_MIN;
++        s_lb.zc = 0;
++        for (int k = 0; k < LB_NUM_FREQ; k++) {
++            s_lb.s1[k] = s_lb.s2[k] = 0.0f;
++        }
++        return;
++    }
++
++    for (uint32_t i = 0; i < n; i++) {
++        s_lb.sum_raw += x[i];
++        if (x[i] < s_lb.raw_min) {
++            s_lb.raw_min = x[i];
++        }
++        if (x[i] > s_lb.raw_max) {
++            s_lb.raw_max = x[i];
++        }
++        /* DC blocker (~20 Hz corner): AC part is what the ear would hear */
++        float xin = (float)x[i];
++        float v = xin - s_lb.hp_x1 + 0.992f * s_lb.hp_y1;
++        s_lb.hp_x1 = xin;
++        s_lb.hp_y1 = v;
++        s_lb.sq += (uint64_t)(v * v);
++        if ((v < 0.0f) != (s_lb.prev < 0.0f)) {
++            s_lb.zc++;
++        }
++        s_lb.prev = v;
++        for (int k = 0; k < LB_NUM_FREQ; k++) {
++            float s = v + s_lb.coeff[k] * s_lb.s1[k] - s_lb.s2[k];
++            s_lb.s2[k] = s_lb.s1[k];
++            s_lb.s1[k] = s;
++        }
++        s_lb.n++;
++    }
++
++    if (s_lb.n >= LB_WIN_SAMPLES) {
++        /* Goertzel power normalised so that a pure tone at f gives ~100 */
++        float norm = (float)s_lb.sq * (float)s_lb.n * 0.5f + 1.0f;
++        unsigned pct[LB_NUM_FREQ];
++        for (int k = 0; k < LB_NUM_FREQ; k++) {
++            float p = s_lb.s1[k] * s_lb.s1[k] + s_lb.s2[k] * s_lb.s2[k] - s_lb.coeff[k] * s_lb.s1[k] * s_lb.s2[k];
++            float r = p / norm * 100.0f;
++            pct[k] = (r < 0.0f) ? 0u : (r > 999.0f ? 999u : (unsigned)r);
++            s_lb.s1[k] = s_lb.s2[k] = 0.0f;
++        }
++        int rms = (int)sqrt((double)s_lb.sq / (double)s_lb.n);
++        int dc = (int)(s_lb.sum_raw / (int64_t)s_lb.n);
++        PR_NOTICE("mic loopback: spk=%d dc=%d min=%d max=%d | ac_rms=%d zc_pct=%u tone_pct: 659=%u 523=%u | 2x: 1318=%u "
++                  "1046=%u | 3x: 1977=%u 1569=%u",
++                  (int)hdl->spk_on, dc, (int)s_lb.raw_min, (int)s_lb.raw_max, rms, (unsigned)(s_lb.zc * 100u / s_lb.n),
++                  pct[0], pct[1], pct[2], pct[3], pct[4], pct[5]);
++        s_lb.n = 0;
++        s_lb.sq = 0;
++        s_lb.sum_raw = 0;
++        s_lb.raw_min = INT32_MAX;
++        s_lb.raw_max = INT32_MIN;
++        s_lb.zc = 0;
++        if (!hdl->spk_on && s_lb.tail) {
++            s_lb.tail--;
++        }
++    }
++}
++#endif
++
++static void __spk_sd_mute_tm_cb(TIMER_ID timer_id, void *arg)
++{
++    (void)timer_id;
++    ESP_I2S_HANDLE_T *hdl = (ESP_I2S_HANDLE_T *)arg;
++    __spk_sd_set(hdl, false);
++}
++
++static OPERATE_RET __spk_sd_init(ESP_I2S_HANDLE_T *hdl)
++{
++    if (NULL == hdl || hdl->cfg.spk_sd_pin >= TUYA_GPIO_NUM_MAX) {
++        return OPRT_OK;
++    }
++
++    TUYA_GPIO_BASE_CFG_T cfg = {
++        .mode   = TUYA_GPIO_PUSH_PULL,
++        .direct = TUYA_GPIO_OUTPUT,
++        .level  = TUYA_GPIO_LEVEL_LOW,
++    };
++    OPERATE_RET rt = tkl_gpio_init(hdl->cfg.spk_sd_pin, &cfg);
++    if (rt != OPRT_OK) {
++        return rt;
++    }
++    __spk_sd_set(hdl, false);
++
++    rt = tal_sw_timer_create(__spk_sd_mute_tm_cb, hdl, &hdl->sd_mute_tm);
++    if (rt != OPRT_OK) {
++        PR_ERR("spk sd mute timer create failed: %d", rt);
++        return rt;
++    }
++    PR_NOTICE("MAX98357 SD mute on GPIO%d (idle=LOW, play=HIGH)", (int)hdl->cfg.spk_sd_pin);
++    return OPRT_OK;
++}
++
+ static void esp32_i2s_read_task(void *args)
+ {
+     ESP_I2S_HANDLE_T *hdl = (ESP_I2S_HANDLE_T *)args;
+@@ -90,6 +257,10 @@ static void esp32_i2s_read_task(void *args)
+                                                    : (int16_t)tmp_value;
+         }
+ 
++#if ENABLE_MIC_LOOPBACK_STATS
++        __mic_loopback_feed(hdl, p_data, samples);
++#endif
++
+         if (hdl->mic_cb) {
+             // Call the callback function with the read data
+             hdl->mic_cb(TDL_AUDIO_FRAME_FORMAT_PCM, TDL_AUDIO_STATUS_RECEIVING, hdl->data_buf,
+@@ -104,6 +275,61 @@ static void esp32_i2s_read_task(void *args)
+     }
+ }
+ 
++#if ENABLE_I2S_TONE_TEST
++/*
++ * Amp diagnostic: 440 Hz for 0.2s (SD HIGH), then 0.3s hard mute (SD LOW).
++ * Rhythm of real quiet gaps = SD+I2S path OK.
++ * Continuous squeal even in "off" = SD not on GPIO17, or BCLK/DIN contact mess.
++ */
++static void esp32_i2s_tone_task(void *args)
++{
++    ESP_I2S_HANDLE_T *hdl = (ESP_I2S_HANDLE_T *)args;
++    const int frames = 256;
++    /* Philips 32-bit stereo: 2 int32 samples per frame (L=R). */
++    int32_t *buf = (int32_t *)tal_malloc(frames * 2 * sizeof(int32_t));
++    if (!buf) {
++        PR_ERR("tone buf alloc failed");
++        return;
++    }
++
++    float ph = 0.0f;
++    const float step = 2.0f * 3.14159265f * 440.0f / 16000.0f;
++    uint32_t sample_i = 0;
++    const uint32_t period = 16000 / 2; /* 0.5 s */
++    const uint32_t on_len = 16000 / 5; /* 0.2 s */
++    bool last_on = false;
++
++    PR_NOTICE("=== I2S RHYTHM+SD-MUTE 440Hz (0.2s on/0.3s SD-LOW) ===");
++
++    for (;;) {
++        bool any_on = false;
++        for (int i = 0; i < frames; i++) {
++            float s = 0.0f;
++            uint32_t pos = sample_i % period;
++            bool on = (pos < on_len);
++            if (on) {
++                any_on = true;
++                s = sinf(ph) * 0.45f;
++                ph += step;
++                if (ph > 6.2831853f) {
++                    ph -= 6.2831853f;
++                }
++            }
++            sample_i++;
++            int32_t s32 = (int32_t)(s * 2147483647.0f);
++            buf[2 * i] = s32;
++            buf[2 * i + 1] = s32;
++        }
++        /* Hard mute in gaps — continuous noise here means SD wiring wrong. */
++        if (any_on != last_on) {
++            __spk_sd_set(hdl, any_on);
++            last_on = any_on;
++        }
++        tkl_i2s_send(hdl->i2s_tx_id, buf, (uint32_t)(frames * 2 * sizeof(int32_t)));
++    }
++}
++#endif
++
+ static OPERATE_RET __tdd_audio_no_codec_open(TDD_AUDIO_HANDLE_T handle, TDL_AUDIO_MIC_CB mic_cb)
+ {
+     OPERATE_RET rt = OPRT_OK;
+@@ -131,11 +357,13 @@ static OPERATE_RET __tdd_audio_no_codec_open(TDD_AUDIO_HANDLE_T handle, TDL_AUDI
+     TUYA_I2S_BASE_CFG_T i2s_tx_cfg = {0};
+     i2s_tx_cfg.mode = TUYA_I2S_MODE_MASTER | TUYA_I2S_MODE_TX;
+     i2s_tx_cfg.sample_rate = 16000;
+-    i2s_tx_cfg.bits_per_sample = TUYA_I2S_BITS_PER_SAMPLE_32BIT;
++    i2s_tx_cfg.bits_per_sample = TUYA_I2S_BITS_PER_SAMPLE_16BIT;
+     tkl_i2s_init(hdl->i2s_tx_id, &i2s_tx_cfg);
+ 
+     PR_NOTICE("I2S channels created");
+ 
++    TUYA_CALL_ERR_RETURN(__spk_sd_init(hdl));
++
+     // data buffer
+     hdl->data_buf_len = I2S_READ_TIME_MS * tdd_i2s_cfg->mic_sample_rate / 1000;
+     hdl->data_buf_len = hdl->data_buf_len * sizeof(int16_t);
+@@ -169,7 +397,7 @@ static OPERATE_RET __tdd_audio_no_codec_open(TDD_AUDIO_HANDLE_T handle, TDL_AUDI
+ 
+     const THREAD_CFG_T thread_cfg = {
+         .thrdname = "esp32_i2s_read",
+-        .stackDepth = 1024,
++        .stackDepth = 3072,
+         .priority = THREAD_PRIO_1,
+     };
+     PR_DEBUG("I2S read task args: %p", hdl);
+@@ -177,6 +405,18 @@ static OPERATE_RET __tdd_audio_no_codec_open(TDD_AUDIO_HANDLE_T handle, TDL_AUDI
+                                                  esp32_i2s_read_task, \
+                                                  (void *)hdl, &thread_cfg));
+ 
++#if ENABLE_I2S_TONE_TEST
++    {
++        THREAD_HANDLE tone_thrd = NULL;
++        const THREAD_CFG_T tone_cfg = {
++            .thrdname = "i2s_tone",
++            .stackDepth = 4096,
++            .priority = THREAD_PRIO_2,
++        };
++        TUYA_CALL_ERR_LOG(
++            tal_thread_create_and_start(&tone_thrd, NULL, NULL, esp32_i2s_tone_task, (void *)hdl, &tone_cfg));
++    }
++#endif
+ 
+     return rt;
+ }
+@@ -188,7 +428,6 @@ static OPERATE_RET __tdd_audio_no_codec_play(TDD_AUDIO_HANDLE_T handle, uint8_t
+     ESP_I2S_HANDLE_T *hdl = (ESP_I2S_HANDLE_T *)handle;
+ 
+     TUYA_CHECK_NULL_RETURN(hdl, OPRT_COM_ERROR);
+-    // TUYA_CHECK_NULL_RETURN(hdl->tx_hdl, OPRT_COM_ERROR);
+     TUYA_CHECK_NULL_RETURN(hdl->mutex_play, OPRT_COM_ERROR);
+ 
+     if (NULL == data || len == 0) {
+@@ -200,35 +439,95 @@ static OPERATE_RET __tdd_audio_no_codec_play(TDD_AUDIO_HANDLE_T handle, uint8_t
+ 
+     int16_t *p_data = (int16_t *)data;
+     uint32_t send_len = len / sizeof(int16_t);
++    uint32_t volume = hdl->play_volume;
++    if (volume > 100) {
++        volume = 100;
++    }
++    if (volume < 50) {
++        volume = 50; /* keep startup tests audible */
++    }
+ 
+-    int32_t *p_send_data = tal_malloc(send_len * sizeof(int32_t));
+-    TUYA_CHECK_NULL_GOTO(p_send_data, __EXIT);
+-
+-    // Convert 16bit to 32bit
+-    int32_t vol_factor = pow(((double)(hdl->play_volume) / 100.0), 2) * 65536;
+-    for (int i = 0; i < send_len; i++) {
+-        int64_t tmp = (int64_t)(p_data[i] * vol_factor);
+-        if (tmp > INT32_MAX) {
+-            tmp = INT32_MAX;
+-        } else if (tmp < INT32_MIN) {
+-            tmp = INT32_MIN;
++    /* Mono int16 → stereo int16 L=R, chunked in internal RAM (matches 16-bit TX). */
++    enum { PLAY_FRAMES = 256 };
++    static int16_t s_dma_buf[PLAY_FRAMES * 2];
++
++    /*
++     * Content statistics of the *incoming* PCM (before volume), for COM diagnostics:
++     *   peak / rms  — level; rms ~0 with peak>0 = mostly silence with clicks
++     *   zc%         — zero-crossing rate. Speech/chime: ~5-20 %, 880 Hz sine: 11 %,
++     *                 white noise / garbage from a broken decode: ~50 %.
++     */
++    int32_t peak = 0;
++    uint64_t sq = 0;
++    uint32_t zc = 0;
++    int16_t prev = p_data[0];
++    for (uint32_t i = 0; i < send_len; i++) {
++        int32_t v = p_data[i];
++        sq += (uint64_t)((int64_t)v * v);
++        if (v < 0) {
++            v = -v;
++        }
++        if (v > peak) {
++            peak = v;
++        }
++        if ((p_data[i] ^ prev) < 0) {
++            zc++;
+         }
+-        p_send_data[i] = (int32_t)(tmp);
++        prev = p_data[i];
+     }
+-    // size_t bytes_written;
+-    // esp_err_t esp_rt = i2s_channel_write(hdl->tx_hdl, p_send_data, send_len * sizeof(int32_t), &bytes_written,
+-    // portMAX_DELAY); if (esp_rt != ESP_OK) {
+-    //     PR_ERR("I2S write failed");
+-    //     rt = OPRT_COM_ERROR;
+-    //     goto __EXIT;
+-    // }
++    int32_t rms = (int32_t)sqrt((double)sq / (double)send_len);
++    uint32_t zc_pct = (zc * 100u) / send_len;
+ 
+-    TUYA_CALL_ERR_LOG(tkl_i2s_send(hdl->i2s_tx_id, p_send_data, send_len * sizeof(int32_t)));
++    __spk_sd_set(hdl, true);
++    if (hdl->sd_mute_tm) {
++        tal_sw_timer_start(hdl->sd_mute_tm, SPK_SD_MUTE_DELAY_MS, TAL_TIMER_ONCE);
++    }
+ 
+-__EXIT:
+-    if (p_send_data) {
+-        tal_free(p_send_data);
+-        p_send_data = NULL;
++    for (uint32_t off = 0; off < send_len;) {
++        uint32_t n = send_len - off;
++        if (n > PLAY_FRAMES) {
++            n = PLAY_FRAMES;
++        }
++        for (uint32_t i = 0; i < n; i++) {
++            int32_t tmp = ((int32_t)p_data[off + i] * (int32_t)volume) / 100;
++            if (tmp > INT16_MAX) {
++                tmp = INT16_MAX;
++            } else if (tmp < INT16_MIN) {
++                tmp = INT16_MIN;
++            }
++            int16_t s = (int16_t)tmp;
++            s_dma_buf[2 * i] = s;
++            s_dma_buf[2 * i + 1] = s;
++        }
++        rt = tkl_i2s_send(hdl->i2s_tx_id, s_dma_buf, n * 2 * sizeof(int16_t));
++        if (rt != OPRT_OK) {
++            PR_ERR("I2S send fail rt=%d off=%u/%u", rt, (unsigned)off, (unsigned)send_len);
++            break;
++        }
++        __spk_sd_set(hdl, true);
++        if (hdl->sd_mute_tm) {
++            tal_sw_timer_start(hdl->sd_mute_tm, SPK_SD_MUTE_DELAY_MS, TAL_TIMER_ONCE);
++        }
++        off += n;
++    }
++
++    /*
++     * Log budget per "utterance": up to 60 lines, refilled after >500 ms of
++     * silence, so every chime / TTS reply gets its own head of statistics
++     * without flooding the COM port for the whole stream.
++     */
++    static uint8_t s_play_log_left = 60;
++    static uint32_t s_last_play_ms = 0;
++    uint32_t now_ms = (uint32_t)tal_system_get_millisecond();
++    if (now_ms - s_last_play_ms > 500u) {
++        s_play_log_left = 60;
++        PR_NOTICE("I2S16 play: new utterance (gap %u ms)", (unsigned)(now_ms - s_last_play_ms));
++    }
++    s_last_play_ms = now_ms;
++    if (s_play_log_left) {
++        s_play_log_left--;
++        PR_NOTICE("I2S16 play samples=%u vol=%u peak=%d rms=%d zc_pct=%u rt=%d", (unsigned)send_len, (unsigned)volume,
++                  (int)peak, (int)rms, (unsigned)zc_pct, rt);
+     }
+ 
+     tal_mutex_unlock(hdl->mutex_play);
+@@ -292,6 +591,11 @@ OPERATE_RET tdd_audio_no_codec_register(char *name, TDD_AUDIO_NO_CODEC_T cfg)
+     _hdl = (ESP_I2S_HANDLE_T *)tal_malloc(sizeof(ESP_I2S_HANDLE_T));
+     TUYA_CHECK_NULL_RETURN(_hdl, OPRT_MALLOC_FAILED);
+     memset(_hdl, 0, sizeof(ESP_I2S_HANDLE_T));
++    _hdl->cfg = cfg;
++    /* GPIO0 is BOOT — treat unset/0 as "SD not software-controlled". */
++    if (_hdl->cfg.spk_sd_pin == TUYA_GPIO_NUM_0) {
++        _hdl->cfg.spk_sd_pin = TUYA_GPIO_NUM_MAX;
++    }
+ 
+     // default play volume
+     _hdl->play_volume = 80;
+diff --git a/boards/ESP32/common/audio/tdd_audio_no_codec.h b/boards/ESP32/common/audio/tdd_audio_no_codec.h
+index 8421ec3b..b4151335 100644
+--- a/boards/ESP32/common/audio/tdd_audio_no_codec.h
++++ b/boards/ESP32/common/audio/tdd_audio_no_codec.h
+@@ -23,6 +23,8 @@ typedef struct {
+     uint8_t i2s_id;
+     uint32_t mic_sample_rate;
+     uint32_t spk_sample_rate;
++    /* MAX98357 SD: HIGH=on. Use TUYA_GPIO_NUM_MAX to leave SD wired to 3V3. */
++    TUYA_GPIO_NUM_E spk_sd_pin;
+ } TDD_AUDIO_NO_CODEC_T;
+ 
+ /***********************************************************
+diff --git a/src/ai_components/ai_agent/src/ai_agent.c b/src/ai_components/ai_agent/src/ai_agent.c
+index 529ebecc..2b9e9e8c 100755
+--- a/src/ai_components/ai_agent/src/ai_agent.c
++++ b/src/ai_components/ai_agent/src/ai_agent.c
+@@ -101,7 +101,9 @@ OPERATE_RET __ai_agent_media_attr_cb(AI_BIZ_ATTR_INFO_T *attr)
+ {
+     /* PR_DEBUG(" ai agent -> recv media attr type: %d", attr->type); */
+     if (attr->type == AI_PT_AUDIO && attr->flag & AI_HAS_ATTR) {
+-        PR_DEBUG("ai agent -> audio codec type: %d", attr->value.audio.base.codec_type);
++        PR_NOTICE("ai agent -> downstream audio attr: codec=%d rate=%u ch=%d bits=%u", attr->value.audio.base.codec_type,
++                  (unsigned)attr->value.audio.base.sample_rate, (int)attr->value.audio.base.channels,
++                  (unsigned)attr->value.audio.base.bit_depth);
+ #if defined(ENABLE_COMP_AI_AUDIO) && (ENABLE_COMP_AI_AUDIO == 1)
+         switch (attr->value.audio.base.codec_type) {
+             case AUDIO_CODEC_MP3:
+diff --git a/src/ai_components/ai_audio/src/ai_audio_player.c b/src/ai_components/ai_audio/src/ai_audio_player.c
+index 01e6a0e2..62338a8d 100755
+--- a/src/ai_components/ai_audio/src/ai_audio_player.c
++++ b/src/ai_components/ai_audio/src/ai_audio_player.c
+@@ -30,6 +30,110 @@
+ #define AI_AUDIO_MUSIC_DIGITAL_GAIN_NORMAL  100
+ #define AI_AUDIO_MUSIC_DIGITAL_GAIN_DUCK    50
+ 
++#include <math.h>
++
++/* Boot-time hardware diagnostics (set both to 0 once the amp path is trusted). */
++#ifndef ENABLE_AUDIO_SILENCE_TEST
++#define ENABLE_AUDIO_SILENCE_TEST 1 /* 2 s SD HIGH + zeros before the chime */
++#endif
++#ifndef ENABLE_AUDIO_MP3_SELFTEST
++#define ENABLE_AUDIO_MP3_SELFTEST 1 /* MP3 ding-dong via player after the chime */
++#endif
++#ifndef ENABLE_AUDIO_DEBUG_SEQ
++#define ENABLE_AUDIO_DEBUG_SEQ 0
++#endif
++/* Dump incoming cloud TTS MP3 bytes over UART as ###TTS hex lines.
++ * Rebuild on PC: python dump_tts.py (see repo monitor tools). Set to 0 when done. */
++#ifndef ENABLE_TTS_UART_DUMP
++#define ENABLE_TTS_UART_DUMP 1
++#endif
++
++/*
++ * Local PCM chime (connect / boot).
++ *
++ * Synthesised in 20 ms chunks straight into tdl_audio_play(). The previous
++ * version tal_malloc'ed a whole note (14-18 KB of *internal* RAM); with ~30 KB
++ * of fragmented internal heap left that failed with OPRT_MALLOC_FAILED
++ * (COM: "AUDIO DEBUG B done rt=-3"), so only one note was ever heard.
++ */
++#define CHIME_SAMPLE_RATE (16000)
++#define CHIME_CHUNK_SAMPLES (320) /* 20 ms */
++#define CHIME_ATTACK_MS (5)
++
++/** One decaying bell-like note (fundamental + 2nd/3rd harmonic), streamed in chunks. */
++static OPERATE_RET __pcm_play_note(TDL_AUDIO_HANDLE_T spk, float hz, int ms, float amp)
++{
++    int16_t buf[CHIME_CHUNK_SAMPLES];
++    const int total = CHIME_SAMPLE_RATE * ms / 1000;
++    const int attack = CHIME_SAMPLE_RATE * CHIME_ATTACK_MS / 1000;
++    const float w = 2.0f * 3.14159265f * hz / (float)CHIME_SAMPLE_RATE;
++    /* Exponential decay down to ~-20 dB at the end of the note. */
++    const float decay = (hz > 0.0f) ? expf(logf(0.10f) / (float)total) : 1.0f;
++    float ph = 0.0f;
++    float env = 1.0f;
++    int done = 0;
++    OPERATE_RET rt = OPRT_OK;
++
++    while (done < total && rt == OPRT_OK) {
++        int n = total - done;
++        if (n > CHIME_CHUNK_SAMPLES) {
++            n = CHIME_CHUNK_SAMPLES;
++        }
++        for (int i = 0; i < n; i++, done++) {
++            if (hz <= 0.0f) { /* silence gap */
++                buf[i] = 0;
++                continue;
++            }
++            float s = sinf(ph) * 0.70f + sinf(2.0f * ph) * 0.20f + sinf(3.0f * ph) * 0.10f;
++            float a = env;
++            if (done < attack) {
++                a *= (float)done / (float)attack;
++            }
++            buf[i] = (int16_t)(s * a * amp);
++            ph += w;
++            if (ph > 6.2831853f) {
++                ph -= 6.2831853f;
++            }
++            env *= decay;
++        }
++        rt = tdl_audio_play(spk, (uint8_t *)buf, (uint32_t)n * sizeof(int16_t));
++    }
++    return rt;
++}
++
++/** Two-note "ding-dong": 659 Hz then 523 Hz, short silence in between. */
++static OPERATE_RET __play_pcm_connect_chime(void)
++{
++    TDL_AUDIO_HANDLE_T spk = NULL;
++    int user_vol = 100;
++    OPERATE_RET rt = OPRT_OK;
++
++    if (tdl_audio_find(AUDIO_CODEC_NAME, &spk) != OPRT_OK || !spk) {
++        PR_ERR("pcm chime: no speaker");
++        return OPRT_COM_ERROR;
++    }
++
++    /* Chime at full scale, then give the user volume back to the speaker driver. */
++    ai_audio_player_get_vol(&user_vol);
++    tdl_audio_volume_set(spk, 100);
++    /* Doorbell-style E5 -> C5; lower and longer than 880/659 so it is not heard as a "beep". */
++    PR_NOTICE("audio player -> PCM ding-dong 659 then 523 Hz");
++
++    rt = __pcm_play_note(spk, 659.0f, 450, 24000.0f);
++    if (rt == OPRT_OK) {
++        rt = __pcm_play_note(spk, 0.0f, 100, 0.0f);
++    }
++    if (rt == OPRT_OK) {
++        rt = __pcm_play_note(spk, 523.0f, 650, 24000.0f);
++    }
++    if (rt != OPRT_OK) {
++        PR_ERR("pcm chime play failed rt=%d", rt);
++    }
++
++    tdl_audio_volume_set(spk, (uint8_t)user_vol);
++    return rt;
++}
++
+ /***********************************************************
+ ***********************typedef define***********************
+ ***********************************************************/
+@@ -49,6 +153,8 @@ static AI_PLAYLIST_HANDLE __s_tone_playlist = NULL;
+ static AI_PLAYER_HANDLE __s_music_player = NULL;
+ static AI_PLAYLIST_HANDLE __s_music_playlist = NULL;
+ static AI_PLAYER_ALERT_CUSTOM_CB __s_alert_custom_cb = NULL;
++static volatile int __s_chime_cooloff_until_ms = 0;
++
+ /***********************************************************
+ ***********************function define**********************
+ ***********************************************************/
+@@ -82,8 +188,17 @@ OPERATE_RET __player_local_alert(AI_AUDIO_ALERT_TYPE_E type)
+         audio_size = sizeof(LOCAL_ALERT_SRC_NET_DISCONNECT);
+     break;
+     case AI_AUDIO_ALERT_NETWORK_CONNECTED:
+-        audio_data = (uint8_t*)LOCAL_ALERT_SRC_NET_CONNECTED;
+-        audio_size = sizeof(LOCAL_ALERT_SRC_NET_CONNECTED);
++#if ENABLE_AUDIO_DEBUG_SEQ
++        PR_NOTICE("pcm chime skipped (AUDIO DEBUG SEQ owns speaker)");
++        return rt;
++#else
++        /* Avoid double chime (boot + AI connected ~few seconds apart). */
++        if ((int)tal_system_get_millisecond() < __s_chime_cooloff_until_ms) {
++            PR_NOTICE("pcm chime skipped (cooloff after boot)");
++            return rt;
++        }
++        return __play_pcm_connect_chime();
++#endif
+     break;
+     case AI_AUDIO_ALERT_BATTERY_LOW:
+         audio_data = (uint8_t*)LOCAL_ALERT_SRC_LOW_BATTERY;
+@@ -193,6 +308,96 @@ static OPERATE_RET __player_event(void *data)
+     return rt;
+ }
+ 
++static void __boot_chime_task(void *arg)
++{
++    (void)arg;
++    TDL_AUDIO_HANDLE_T spk = NULL;
++
++    PR_NOTICE("=== AUDIO DEBUG SEQ start ===");
++    /* Settle after input_init opened I2S. */
++    tal_system_sleep(2000);
++
++    for (int w = 0; w < 50; w++) {
++        if (tdl_audio_find(AUDIO_CODEC_NAME, &spk) == OPRT_OK && spk) {
++            break;
++        }
++        spk = NULL;
++        tal_system_sleep(100);
++    }
++    if (!spk) {
++        PR_ERR("AUDIO DEBUG: tdl_audio_find FAILED — stop");
++        return;
++    }
++    tdl_audio_volume_set(spk, 100);
++    PR_NOTICE("AUDIO DEBUG: speaker ok, vol=100");
++
++#if ENABLE_AUDIO_DEBUG_SEQ
++    /*
++     * Phase A — exact pattern that previously worked:
++     * clear 880 Hz, 0.3s on / 0.7s off, three times.
++     */
++    PR_NOTICE("AUDIO DEBUG A: rhythmic 880Hz x3 (expect clear tone, not hiss)");
++    for (int i = 1; i <= 3; i++) {
++        OPERATE_RET rt = __pcm_play_note(spk, 880.0f, 300, 28000.0f);
++        PR_NOTICE("AUDIO DEBUG A#%d play rt=%d", i, rt);
++        tal_system_sleep(700);
++    }
++
++    tal_system_sleep(500);
++
++    /*
++     * Phase B — PCM ding-dong (high then low), same tdl_audio_play path.
++     */
++    PR_NOTICE("AUDIO DEBUG B: PCM ding-dong 880→523");
++    {
++        OPERATE_RET rt = __play_pcm_connect_chime();
++        PR_NOTICE("AUDIO DEBUG B done rt=%d", rt);
++    }
++
++    tal_system_sleep(800);
++
++    /*
++     * Phase C — heartbeat so we know firmware still alive if A/B were missed.
++     * Short 880Hz every 4s, forever (disable ENABLE_AUDIO_DEBUG_SEQ later).
++     */
++    PR_NOTICE("AUDIO DEBUG C: heartbeat 880Hz every 4s");
++    for (;;) {
++        OPERATE_RET rt = __pcm_play_note(spk, 880.0f, 200, 25000.0f);
++        PR_NOTICE("AUDIO DEBUG C heartbeat rt=%d", rt);
++        tal_system_sleep(4000);
++    }
++#else
++#if ENABLE_AUDIO_SILENCE_TEST
++    /*
++     * Hardware check: unmute the amp (SD HIGH) and feed digital zeros for 2 s.
++     * A healthy MAX98357A with valid BCLK/LRCLK and DIN=0 is completely silent.
++     * Any hiss / squeal here is wiring, supply or ground — not firmware.
++     */
++    PR_NOTICE("silence test: SD HIGH + zeros for 2 s (must be inaudible)");
++    __pcm_play_note(spk, 0.0f, 2000, 0.0f);
++    tal_system_sleep(700); /* let the SD mute timer drop the pin again */
++#endif
++    PR_NOTICE("boot chime: play PCM ding-dong now");
++    __play_pcm_connect_chime();
++    __s_chime_cooloff_until_ms = (int)tal_system_get_millisecond() + 15000;
++#if ENABLE_AUDIO_MP3_SELFTEST
++    /*
++     * Diagnostic: push the built-in MP3 ding-dong through the full
++     * player -> minimp3 -> speaker path right after the PCM chime, so the
++     * decoder output can be judged from the I2S16 play peak/rms/zc_pct log
++     * without needing a cloud round-trip. Compare against the PCM chime:
++     * sane decode = decaying peaks, zc_pct ~5..20; garbage = flat peaks, zc_pct ~50.
++     */
++    tal_system_sleep(1500);
++    PR_NOTICE("mp3 selftest: play media_src_dingdong (%u B) via player", (unsigned)sizeof(media_src_dingdong));
++    {
++        OPERATE_RET rt = ai_audio_play_data(AI_AUDIO_CODEC_MP3, (uint8_t *)media_src_dingdong, sizeof(media_src_dingdong));
++        PR_NOTICE("mp3 selftest: play_data rt=%d", rt);
++    }
++#endif
++#endif
++}
++
+ /**
+ @brief Initialize the audio player module
+ @return OPERATE_RET Operation result
+@@ -220,6 +425,17 @@ OPERATE_RET ai_audio_player_init(void)
+     /* Player state */
+     TUYA_CALL_ERR_GOTO(tal_event_subscribe(EVENT_AI_PLAYER_STATE, "ai_player", __player_event, SUBSCRIBE_TYPE_NORMAL), __error);
+ 
++    /* Startup chime once audio path is up (also on AI connected). */
++    {
++        THREAD_HANDLE thrd = NULL;
++        const THREAD_CFG_T tcfg = {
++            .thrdname = "boot_chime",
++            .stackDepth = 8192,
++            .priority = THREAD_PRIO_2,
++        };
++        TUYA_CALL_ERR_LOG(tal_thread_create_and_start(&thrd, NULL, NULL, __boot_chime_task, NULL, &tcfg));
++    }
++
+     return rt;
+ 
+ __error:
+@@ -374,13 +590,46 @@ OPERATE_RET ai_audio_play_data(AI_AUDIO_CODEC_E format, uint8_t *data, uint32_t
+ @param len TTS data length
+ @return OPERATE_RET Operation result
+ */
++#if ENABLE_TTS_UART_DUMP
++/* 16 bytes/line — longer hex lines were truncated by the log formatter. */
++static void __tts_uart_dump(const uint8_t *data, int len, uint32_t offset)
++{
++    static const char *hexd = "0123456789ABCDEF";
++    char hex[16 * 2 + 1];
++    int i = 0;
++    while (i < len) {
++        int n = len - i;
++        if (n > 16) {
++            n = 16;
++        }
++        for (int j = 0; j < n; j++) {
++            uint8_t b = data[i + j];
++            hex[j * 2] = hexd[b >> 4];
++            hex[j * 2 + 1] = hexd[b & 0x0F];
++        }
++        hex[n * 2] = '\0';
++        PR_NOTICE("###TTS %u %s", (unsigned)(offset + (uint32_t)i), hex);
++        i += n;
++    }
++}
++#endif
++
+ OPERATE_RET ai_audio_play_tts_stream(AI_AUDIO_PLAYER_TTS_STATE_E state, AI_AUDIO_CODEC_E codec, char *data,  int len)
+ {
+     OPERATE_RET rt = OPRT_OK;
++    /* Per-utterance accounting: DATA chunks are not logged one by one, so
++     * "start -> stop without DATA lines" on COM says nothing about payload. */
++    static uint32_t __s_tts_bytes = 0;
++    static uint32_t __s_tts_chunks = 0;
+     
+     switch(state) {
+     case AI_AUDIO_PLAYER_TTS_START:
+-        PR_DEBUG("audio player -> tts stream start");
++        __s_tts_bytes = 0;
++        __s_tts_chunks = 0;
++        PR_NOTICE("audio player -> tts stream start (codec %d)", (int)codec);
++#if ENABLE_TTS_UART_DUMP
++        PR_NOTICE("###TTS_BEGIN codec=%d", (int)codec);
++#endif
+         __s_tts_play_flag = TRUE;
+         ai_user_event_notify(AI_USER_EVT_TTS_PRE, NULL);
+         TUYA_CALL_ERR_LOG(tuya_ai_playlist_clear(__s_tone_playlist));
+@@ -388,19 +637,36 @@ OPERATE_RET ai_audio_play_tts_stream(AI_AUDIO_PLAYER_TTS_STATE_E state, AI_AUDIO
+         ai_user_event_notify(AI_USER_EVT_TTS_START, NULL);
+         break;
+     case AI_AUDIO_PLAYER_TTS_DATA:
+-        // PR_DEBUG("audio player -> tts stream data %d", len);        
+         if (data && len > 0 && __s_tts_play_flag) {
++#if ENABLE_TTS_UART_DUMP
++            __tts_uart_dump((const uint8_t *)data, len, __s_tts_bytes);
++#endif
++            __s_tts_bytes += (uint32_t)len;
++            __s_tts_chunks++;
++            if (__s_tts_chunks == 1) {
++                PR_NOTICE("audio player -> tts first chunk %d B: %02X %02X %02X %02X", len,
++                          (uint8_t)data[0], (len > 1) ? (uint8_t)data[1] : 0,
++                          (len > 2) ? (uint8_t)data[2] : 0, (len > 3) ? (uint8_t)data[3] : 0);
++            }
+             TUYA_CALL_ERR_LOG(tuya_ai_player_feed(__s_tone_player, (uint8_t *)data, len));
+         }
+         ai_user_event_notify(AI_USER_EVT_TTS_DATA, NULL);
+         break;
+     case AI_AUDIO_PLAYER_TTS_STOP:
+-        PR_DEBUG("audio player -> tts stream stop");
++        PR_NOTICE("audio player -> tts stream stop: %u B in %u chunks", (unsigned)__s_tts_bytes,
++                  (unsigned)__s_tts_chunks);
++#if ENABLE_TTS_UART_DUMP
++        PR_NOTICE("###TTS_END bytes=%u chunks=%u", (unsigned)__s_tts_bytes, (unsigned)__s_tts_chunks);
++#endif
+         TUYA_CALL_ERR_LOG(tuya_ai_player_feed(__s_tone_player, NULL, 0));
+         ai_user_event_notify(AI_USER_EVT_TTS_STOP, NULL);
+         break;
+     case AI_AUDIO_PLAYER_TTS_ABORT:
+-        PR_DEBUG("audio player -> tts stream abort");
++        PR_NOTICE("audio player -> tts stream abort: %u B in %u chunks", (unsigned)__s_tts_bytes,
++                  (unsigned)__s_tts_chunks);
++#if ENABLE_TTS_UART_DUMP
++        PR_NOTICE("###TTS_ABORT bytes=%u", (unsigned)__s_tts_bytes);
++#endif
+         TUYA_CALL_ERR_LOG(tuya_ai_player_feed(__s_tone_player, NULL, 0));
+         ai_user_event_notify(AI_USER_EVT_TTS_ABORT, NULL);
+         break;
+diff --git a/src/audio_player/src/decoder/decoder_mp3.c b/src/audio_player/src/decoder/decoder_mp3.c
+index 108461f1..50db9c70 100755
+--- a/src/audio_player/src/decoder/decoder_mp3.c
++++ b/src/audio_player/src/decoder/decoder_mp3.c
+@@ -35,6 +35,7 @@
+ 
+ typedef struct {
+     bool is_first_frame;
++    bool info_logged;
+     mp3dec_t decoder;
+     uint32_t id3_size;
+ } DECODER_MP3_CTX_T;
+@@ -147,10 +148,22 @@ DECODE_MORE:
+         if(frame_info.frame_bytes == 0) {
+             // Need more data - frame_bytes=0 means no valid frame found, need more input
+             return temp_len;
+-        } else {
+-            PR_ERR("decoder_mp3_process: invalid frame_bytes=%d, in_len=%d", frame_info.frame_bytes, in_len);
+-            return 0;
+         }
++
++        /*
++         * A frame was parsed but produced no PCM (bit reservoir not yet filled at
++         * stream start, junk between frames, ...). minimp3 semantics: advance by
++         * frame_bytes and carry on. Returning 0 here made the player drop the whole
++         * input buffer (up to AI_PLAYER_FRAMEBUF_SIZE of undecoded audio).
++         */
++        PR_DEBUG("decoder_mp3_process: skip %d bytes without pcm, in_len=%d", frame_info.frame_bytes, in_len);
++        in_buf += frame_info.frame_bytes;
++        in_len -= frame_info.frame_bytes;
++        if((in_len > 2) && pcm_buf_samples > 0) {
++            temp_len = in_len;
++            goto DECODE_MORE;
++        }
++        return (in_len > 0) ? in_len : 0;
+     }
+ 
+     // Update input buffer position
+@@ -158,6 +171,11 @@ DECODE_MORE:
+     in_len -= frame_info.frame_bytes;
+ 
+     if(frame_info.channels > 0 && samples > 0) {
++        if (!ctx->info_logged) {
++            ctx->info_logged = true;
++            PR_NOTICE("mp3 stream: %d Hz, %d ch, %d kbps, layer %d, %d samples/frame", frame_info.hz, frame_info.channels,
++                      frame_info.bitrate_kbps, frame_info.layer, samples);
++        }
+         // mp3dec_decode_frame returns samples per channel, not total samples
+         // Total samples written to pcm buffer = samples * channels
+         uint32_t total_samples = samples * frame_info.channels;
+diff --git a/src/audio_player/src/decoder/minimp3/minimp3.h b/src/audio_player/src/decoder/minimp3/minimp3.h
+index be3b6d61..3a0debc9 100755
+--- a/src/audio_player/src/decoder/minimp3/minimp3.h
++++ b/src/audio_player/src/decoder/minimp3/minimp3.h
+@@ -1316,12 +1316,12 @@ static void L3_save_reservoir(mp3dec_t *h, mp3dec_scratch_t *s)
+ 
+ static int L3_restore_reservoir(mp3dec_t *h, bs_t *bs, mp3dec_scratch_t *s, int main_data_begin)
+ {
+-    // Early check: if reservoir doesn't have enough data, return failure immediately
+-    if (h->reserv < main_data_begin) {
+-        PR_ERR("L3_restore_reservoir: h->reserv:%d < main_data_begin:%d", h->reserv, main_data_begin);
+-        return 0;
+-    }
+-
++    /*
++     * Always stage this frame's main data into s->bs, even when the reservoir is
++     * short: L3_save_reservoir() below then keeps it for the *next* frame (upstream
++     * minimp3 behaviour). Returning early left s->bs zeroed, the reservoir was
++     * reset to 0 and every following frame with main_data_begin > 0 failed too.
++     */
+     int frame_bytes = (bs->limit - bs->pos) / 8;
+     int bytes_have = MINIMP3_MIN(h->reserv, main_data_begin);
+     memcpy(s->maindata, h->reserv_buf + MINIMP3_MAX(0, h->reserv - main_data_begin),
+@@ -1329,6 +1329,11 @@ static int L3_restore_reservoir(mp3dec_t *h, bs_t *bs, mp3dec_scratch_t *s, int
+     memcpy(s->maindata + bytes_have, bs->buf + bs->pos / 8, frame_bytes);
+     bs_init(&s->bs, s->maindata, bytes_have + frame_bytes);
+ 
++    if (h->reserv < main_data_begin) {
++        PR_DEBUG("L3_restore_reservoir: h->reserv:%d < main_data_begin:%d", h->reserv, main_data_begin);
++        return 0;
++    }
++
+     return 1; // Success
+ }
+ 
+diff --git a/tools/cli_command/cli_prepare.py b/tools/cli_command/cli_prepare.py
+index aa32a944..d132a35e 100644
+--- a/tools/cli_command/cli_prepare.py
++++ b/tools/cli_command/cli_prepare.py
+@@ -277,6 +277,21 @@ def resolve_venv_tool(binary: str) -> Optional[str]:
+     return shutil.which(binary, path=scripts)
+ 
+ 
++def _espressif_cmake_exe() -> Optional[str]:
++    """Windows fallback when the pip cmake launcher is blocked by WDAC/Smart App Control."""
++    if sys.platform != "win32":
++        return None
++    candidates = [
++        os.environ.get("OPEN_SDK_CMAKE"),
++        r"C:\Espressif\tools\cmake\3.30.2\bin\cmake.exe",
++        os.path.expandvars(r"%USERPROFILE%\cmake\bin\cmake.exe"),
++    ]
++    for path in candidates:
++        if path and os.path.isfile(path) and _tool_runs_ok(path):
++            return path
++    return None
++
++
+ def ensure_venv_tool(pkg: str, binary: str) -> Tuple[bool, Optional[str]]:
+     """Ensure a venv-managed tool exists and actually runs; repair if not.
+ 
+@@ -308,6 +323,13 @@ def ensure_venv_tool(pkg: str, binary: str) -> Tuple[bool, Optional[str]]:
+             logger.note(f"[{binary}] repaired.")
+             return True, exe
+ 
++    if binary == "cmake":
++        esp = _espressif_cmake_exe()
++        if esp:
++            logger.note(f"[cmake] using fallback: {esp}")
++            _prepend_to_path(os.path.dirname(esp))
++            return True, esp
++
+     return False, exe
+ 
+ 
+@@ -348,6 +370,10 @@ def ensure_build_env() -> bool:
+     if not ensure_build_tools():
+         return False
+     prepend_venv_scripts_to_path()
++    # Prefer a working Espressif cmake over a WDAC-blocked pip launcher in Scripts.
++    esp = _espressif_cmake_exe()
++    if esp:
++        _prepend_to_path(os.path.dirname(esp))
+     return True
+ 
+ 
