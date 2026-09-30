@@ -1,0 +1,505 @@
+diff --git a/tuya_open_sdk/tuyaos_adapter/include/kws/tkl_kws.h b/tuya_open_sdk/tuyaos_adapter/include/kws/tkl_kws.h
+index 7e4b860..8be4e4d 100755
+--- a/tuya_open_sdk/tuyaos_adapter/include/kws/tkl_kws.h
++++ b/tuya_open_sdk/tuyaos_adapter/include/kws/tkl_kws.h
+@@ -42,6 +42,9 @@ OPERATE_RET tkl_kws_enable(void);
+ 
+ OPERATE_RET tkl_kws_disable(void);
+ 
++/** Feed PCM from mic (16-bit mono @ 16 kHz). Call every I2S read while IDLE. */
++void tkl_kws_feed(const int16_t *samples, int n_samples);
++
+ OPERATE_RET tkl_kws_deinit(void);
+ 
+ 
+diff --git a/tuya_open_sdk/tuyaos_adapter/include/media/audio_afe.h b/tuya_open_sdk/tuyaos_adapter/include/media/audio_afe.h
+index c61ff3e..3ca68f6 100644
+--- a/tuya_open_sdk/tuyaos_adapter/include/media/audio_afe.h
++++ b/tuya_open_sdk/tuyaos_adapter/include/media/audio_afe.h
+@@ -36,6 +36,9 @@ void auio_afe_processor_start(void);
+ 
+ void auio_afe_processor_end(void);
+ 
++/** Enable/disable WakeNet. Disable during LISTEN so AFE VAD can gate cloud ASR. */
++void auio_afe_wakenet_set(bool enable);
++
+ void auio_afe_register_wakeup_cb(AUDIO_AFE_WAKEUP_CB cb);
+ 
+ void auio_afe_register_vad_cb(AUDIO_AFE_VAD_CB cb);
+diff --git a/tuya_open_sdk/tuyaos_adapter/src/audio/audio_afe.c b/tuya_open_sdk/tuyaos_adapter/src/audio/audio_afe.c
+index be5f99e..050ff74 100644
+--- a/tuya_open_sdk/tuyaos_adapter/src/audio/audio_afe.c
++++ b/tuya_open_sdk/tuyaos_adapter/src/audio/audio_afe.c
+@@ -61,8 +61,7 @@ static void __afe_feed_task(void *arg)
+         tkl_mutex_unlock(sg_afe_proce.rb_mutex);
+         if (used_size < sg_afe_proce.uint_size) {
+             // wait for data
+-            // ESP_LOGI(TAG, "Waiting for data...");
+-            tkl_system_sleep(10);
++            tkl_system_sleep(5);
+             continue;
+         }
+ 
+@@ -74,8 +73,7 @@ static void __afe_feed_task(void *arg)
+ 
+         sg_afe_proce.afe_iface->feed(sg_afe_proce.afe_data,\
+                                      (const int16_t *)feed_data);
+-
+-        tkl_system_sleep(10);
++        /* Do not sleep after feed — drain RB ASAP so WakeNet gets continuous PCM. */
+     }
+ }
+ 
+@@ -98,18 +96,40 @@ static void __afe_detect_task(void *arg)
+             sg_afe_vad_cb(res->vad_state);
+         }
+ 
++        /* Occasional volume/state breadcrumb while hunting missed wakes. */
++        {
++            static uint32_t s_fetch;
++            int32_t fpeak = 0;
++            if (res->data && res->data_size > 0) {
++                const int16_t *fp = (const int16_t *)res->data;
++                int fn = res->data_size / (int)sizeof(int16_t);
++                for (int i = 0; i < fn; i++) {
++                    int32_t a = fp[i] < 0 ? -fp[i] : fp[i];
++                    if (a > fpeak) {
++                        fpeak = a;
++                    }
++                }
++            }
++            if ((++s_fetch % 50u) == 0u) {
++                ESP_LOGI(TAG, "afe fetch: vol=%.1fdB wake_st=%d vad=%d out_peak=%d raw_size=%d",
++                         res->data_volume, (int)res->wakeup_state, (int)res->vad_state,
++                         (int)fpeak, (int)res->data_size);
++            }
++        }
++
+         // Set wake word status
+         if (res->wakeup_state == WAKENET_DETECTED) {
+             ESP_LOGI(TAG, "wakeword detected");
+             ESP_LOGI(TAG, "model index:%d, word index:%d", res->wakenet_model_index, res->wake_word_index);
+             ESP_LOGI(TAG, "-----------LISTENING-----------");
+ 
+-            if (1 == res->wakenet_model_index) {
+-                //wakeup callback
+-                if(sg_afe_wakeup_cb) {
+-                    sg_afe_wakeup_cb();
+-                }
+-            } 
++            /* Single-model boards still report index 1; accept any positive index
++             * so a future multi-model build doesn't silently drop detections. */
++            if (sg_afe_wakeup_cb && res->wakenet_model_index >= 1) {
++                sg_afe_wakeup_cb();
++            } else if (sg_afe_wakeup_cb) {
++                ESP_LOGW(TAG, "wakeword ignored: model_index=%d", res->wakenet_model_index);
++            }
+         }
+     }
+ }
+@@ -131,12 +151,16 @@ static OPERATE_RET __esp_afe_init(void)
+     }
+ 
+     char* ns_model_name = esp_srmodel_filter(models, ESP_NSNET_PREFIX, NULL);
++    (void)ns_model_name;
+ 
+     afe_config_t* afe_config = afe_config_init("M", models, AFE_TYPE_SR, AFE_MODE_HIGH_PERF);
+     afe_config->aec_init = false;
+-    afe_config->ns_init = true;
+-    afe_config->ns_model_name = ns_model_name;
++    afe_config->ns_init = false;
++    afe_config->ns_model_name = NULL;
+     afe_config->afe_ns_mode = AFE_NS_MODE_NET;
++    /* WakeNet runs standalone in tkl_kws (Hi Lexin → virtual BOOT).
++     * AFE here is VAD-only for LISTEN / cloud ASR. */
++    afe_config->wakenet_init = false;
+     afe_config->vad_init = true;
+     afe_config->vad_mode = VAD_MODE_0;
+     afe_config->vad_min_speech_ms = 128*4;
+@@ -161,12 +185,15 @@ static OPERATE_RET __esp_afe_init(void)
+         goto __EXIT;
+     }
+ 
+-    // get required data size
++    // get required data size — must match Espressif feed API (chunk * channels)
+     int chunksize = sg_afe_proce.afe_iface->get_feed_chunksize(sg_afe_proce.afe_data);
+-    // TODO: support multi-channel
+-    int feed_channel = 1;
++    int feed_channel = sg_afe_proce.afe_iface->get_feed_channel_num(sg_afe_proce.afe_data);
++    if (feed_channel <= 0) {
++        feed_channel = 1;
++    }
+     sg_afe_proce.uint_size = chunksize * sizeof(int16_t) * feed_channel;
+-    ESP_LOGI(TAG, "Process unit size: %ld", sg_afe_proce.uint_size);
++    ESP_LOGI(TAG, "Process unit size: %ld (chunk=%d ch=%d)", sg_afe_proce.uint_size, chunksize,
++             feed_channel);
+ 
+ __EXIT:
+     if (NULL == afe_config) {
+@@ -209,6 +236,9 @@ OPERATE_RET audio_afe_processor_init(void)
+     ESP_LOGI(TAG, "AFE initialized successfully");
+ 
+     sg_afe_proce.is_init = true;
++    /* Keep feed/detect running from boot so WakeNet works in chat IDLE
++     * (tkl_vad_stop must not starve KWS while waiting for 你好小智 / HEY_TUYA brand). */
++    sg_afe_proce.is_start = true;
+ 
+     return OPRT_OK;
+ }
+@@ -228,6 +258,26 @@ void auio_afe_processor_feed(uint8_t *data, int len)
+         return;
+     }
+ 
++    /* Feed AFE at native mic level. Gain×4 made peaks loud but WakeNet still
++     * never fired (wake_st=0 with out_peak>10k) — try clean PCM for wn9_hilexin. */
++    enum { AFE_MIC_GAIN = 1 };
++    int16_t *p = (int16_t *)data;
++    int n = len / (int)sizeof(int16_t);
++    int32_t peak = 0;
++    for (int i = 0; i < n; i++) {
++        int32_t v = (int32_t)p[i] * AFE_MIC_GAIN;
++        if (v > 32767) {
++            v = 32767;
++        } else if (v < -32768) {
++            v = -32768;
++        }
++        p[i] = (int16_t)v;
++        int32_t a = v < 0 ? -v : v;
++        if (a > peak) {
++            peak = a;
++        }
++    }
++
+     tkl_mutex_lock(sg_afe_proce.rb_mutex);
+ 
+     uint32_t free_size = tuya_ring_buff_free_size_get(sg_afe_proce.rb);
+@@ -237,6 +287,21 @@ void auio_afe_processor_feed(uint8_t *data, int len)
+     tuya_ring_buff_write(sg_afe_proce.rb, data, len);
+ 
+     tkl_mutex_unlock(sg_afe_proce.rb_mutex);
++
++    /* ~1 Hz: prove mic PCM actually reaches WakeNet while idle. */
++    {
++        static uint32_t s_feeds;
++        static int32_t s_peak;
++        if (peak > s_peak) {
++            s_peak = peak;
++        }
++        if (++s_feeds >= 50u) {
++            ESP_LOGI(TAG, "afe feed alive: peak=%d bytes=%d start=%d gain=%d", (int)s_peak, len,
++                     (int)sg_afe_proce.is_start, AFE_MIC_GAIN);
++            s_feeds = 0;
++            s_peak = 0;
++        }
++    }
+ }
+ 
+ void auio_afe_processor_start(void)
+@@ -246,19 +311,47 @@ void auio_afe_processor_start(void)
+     }
+ 
+     sg_afe_proce.is_start = true;
++    ESP_LOGI(TAG, "afe processor start");
+ }
+ 
+ void auio_afe_processor_end(void)
+ {
+-    if(false == sg_afe_proce.is_start) {
++    /* Do NOT clear is_start: WakeNet must keep listening in product IDLE.
++     * Only drop stale samples so a later speech segment starts clean. */
++    if (false == sg_afe_proce.is_init) {
+         return;
+     }
+-    
+-    sg_afe_proce.is_start = false;
+ 
+     tkl_mutex_lock(sg_afe_proce.rb_mutex);
+     tuya_ring_buff_reset(sg_afe_proce.rb);
+     tkl_mutex_unlock(sg_afe_proce.rb_mutex);
++    ESP_LOGI(TAG, "afe processor rb reset (keep running for KWS)");
++}
++
++void auio_afe_wakenet_set(bool enable)
++{
++    /* Name kept for call sites: enable=true → IDLE (VAD off); false → LISTEN (VAD on).
++     * WakeNet itself lives in tkl_kws (standalone). */
++    if (false == sg_afe_proce.is_init || NULL == sg_afe_proce.afe_iface ||
++        NULL == sg_afe_proce.afe_data) {
++        return;
++    }
++
++    int rc_vad = -1;
++    if (enable) {
++        if (sg_afe_proce.afe_iface->disable_vad) {
++            rc_vad = sg_afe_proce.afe_iface->disable_vad(sg_afe_proce.afe_data);
++        }
++        ESP_LOGI(TAG, "afe mode IDLE: vad OFF (rc=%d)", rc_vad);
++    } else {
++        if (sg_afe_proce.afe_iface->enable_vad) {
++            rc_vad = sg_afe_proce.afe_iface->enable_vad(sg_afe_proce.afe_data);
++        }
++        if (sg_afe_proce.afe_iface->reset_vad) {
++            sg_afe_proce.afe_iface->reset_vad(sg_afe_proce.afe_data);
++        }
++        ESP_LOGI(TAG, "afe mode LISTEN: vad ON (rc=%d)", rc_vad);
++    }
+ }
+ 
+ void auio_afe_register_wakeup_cb(AUDIO_AFE_WAKEUP_CB cb)
+diff --git a/tuya_open_sdk/tuyaos_adapter/src/audio/tkl_kws.c b/tuya_open_sdk/tuyaos_adapter/src/audio/tkl_kws.c
+index 49293bc..f8af63f 100755
+--- a/tuya_open_sdk/tuyaos_adapter/src/audio/tkl_kws.c
++++ b/tuya_open_sdk/tuyaos_adapter/src/audio/tkl_kws.c
+@@ -1,8 +1,6 @@
+ /**
+  * @file tkl_kws.c
+- * @brief tkl_kws module is used to 
+- * @version 0.1
+- * @date 2025-04-15
++ * @brief Espressif WakeNet (Hi Lexin) → product wake. Independent of AFE/Tuya KWS.
+  */
+ #include "tuya_cloud_types.h"
+ 
+@@ -10,43 +8,104 @@
+ 
+ #include "esp_err.h"
+ #include "esp_log.h"
++#include "esp_wn_iface.h"
++#include "esp_wn_models.h"
++#include "model_path.h"
++
++#include <string.h>
+ 
+ #include "tkl_kws.h"
++#include "tkl_memory.h"
+ 
+ /***********************************************************
+ ************************macro define************************
+ ***********************************************************/
+ #define TAG "tkl_kws"
+ 
+-/***********************************************************
+-***********************typedef define***********************
+-***********************************************************/
+-
+-
+-/***********************************************************
+-********************function declaration********************
+-***********************************************************/
+-
+-
+ /***********************************************************
+ ***********************variable define**********************
+ ***********************************************************/
+ static TKL_KWS_WAKEUP_CB sg_wakeup_cb = NULL;
+ static bool sg_is_kws_enable = false;
+ 
++static const esp_wn_iface_t *sg_wn = NULL;
++static model_iface_data_t *sg_wn_data = NULL;
++static int16_t *sg_wn_buf = NULL;
++static int sg_wn_chunk = 0;
++static int sg_wn_filled = 0;
++static int sg_wn_channels = 1;
++/* Extra digital gain on the KWS path only. Mic PCM is already >>14 (x4 vs the usual >>16);
++ * idle peaks ~500-1300, speech at 0.3-1 m ~3k-15k, so anything above ~2x clips speech. */
++#ifndef TKL_KWS_GAIN
++#define TKL_KWS_GAIN 2.0f
++#endif
++static float sg_wn_gain = TKL_KWS_GAIN;
++
+ /***********************************************************
+ ***********************function define**********************
+ ***********************************************************/
+-static void __afe_wakeup_callback(void)
++OPERATE_RET tkl_kws_init(void)
+ {
+-    if(true == sg_is_kws_enable && sg_wakeup_cb) {
+-        sg_wakeup_cb(TKL_KWS_WAKEUP_NIHAO_XIAOZHI);
++    srmodel_list_t *models = esp_srmodel_init("model");
++    if (NULL == models || models->num <= 0) {
++        ESP_LOGE(TAG, "no SR models in flash partition 'model'");
++        return OPRT_COM_ERROR;
+     }
+-}
+ 
+-OPERATE_RET tkl_kws_init(void)
+-{
+-    auio_afe_register_wakeup_cb(__afe_wakeup_callback);
++    char *model_name = NULL;
++    for (int i = 0; i < models->num; i++) {
++        if (models->model_name[i] && strstr(models->model_name[i], "hilexin")) {
++            model_name = models->model_name[i];
++            break;
++        }
++    }
++    if (NULL == model_name) {
++        model_name = esp_srmodel_filter(models, ESP_WN_PREFIX, NULL);
++    }
++    if (NULL == model_name) {
++        ESP_LOGE(TAG, "no WakeNet model found");
++        return OPRT_COM_ERROR;
++    }
++
++    sg_wn = esp_wn_handle_from_name(model_name);
++    if (NULL == sg_wn) {
++        ESP_LOGE(TAG, "esp_wn_handle_from_name(%s) failed", model_name);
++        return OPRT_COM_ERROR;
++    }
++
++    sg_wn_data = sg_wn->create(model_name, DET_MODE_95);
++    if (NULL == sg_wn_data) {
++        ESP_LOGE(TAG, "WakeNet create failed");
++        return OPRT_COM_ERROR;
++    }
++
++    sg_wn_chunk = sg_wn->get_samp_chunksize(sg_wn_data);
++    int rate = sg_wn->get_samp_rate(sg_wn_data);
++    sg_wn_channels = sg_wn->get_channel_num ? sg_wn->get_channel_num(sg_wn_data) : 1;
++    if (sg_wn_channels <= 0) {
++        sg_wn_channels = 1;
++    }
++    /* Buffer holds chunk * channels (mono model → 1). */
++    int buf_samples = sg_wn_chunk * sg_wn_channels;
++    sg_wn_buf = (int16_t *)tkl_system_malloc((size_t)buf_samples * sizeof(int16_t));
++    if (NULL == sg_wn_buf || sg_wn_chunk <= 0) {
++        ESP_LOGE(TAG, "WakeNet buf alloc failed chunk=%d", sg_wn_chunk);
++        return OPRT_COM_ERROR;
++    }
++    memset(sg_wn_buf, 0, (size_t)buf_samples * sizeof(int16_t));
++    sg_wn_filled = 0;
++
++    sg_wn->set_det_threshold(sg_wn_data, 0.40f, 1);
++    /* NOTE: do not call get_vol_gain() here — it estimates gain from audio the model has
++     * already seen, and right after create() it returns garbage (~10x -> hard clipping of
++     * every spoken word, which is exactly what WakeNet cannot decode). Fixed gain instead. */
++
++    const char *ww = esp_wn_wakeword_from_name(model_name);
++    char *ww1 = sg_wn->get_word_name(sg_wn_data, 1);
++    ESP_LOGI(TAG, "standalone WakeNet ready: model=%s ww=%s word1=%s chunk=%d rate=%d ch=%d gain=%.1f",
++             model_name, ww ? ww : "?", ww1 ? ww1 : "?", sg_wn_chunk, rate, sg_wn_channels,
++             sg_wn_gain);
++    ESP_LOGI(TAG, "say clearly: Hi Lexin   (Chinese model word: hai le-xin)");
+ 
+     return OPRT_OK;
+ }
+@@ -54,30 +113,112 @@ OPERATE_RET tkl_kws_init(void)
+ OPERATE_RET tkl_kws_reg_wakeup_cb(TKL_KWS_WAKEUP_CB wakeup_cb)
+ {
+     sg_wakeup_cb = wakeup_cb;
+-
+     return OPRT_OK;
+ }
+ 
+ OPERATE_RET tkl_kws_enable(void)
+ {
+     sg_is_kws_enable = true;
+-
++    sg_wn_filled = 0;
++    /* IDLE: AFE VAD off (LISTEN path toggles it back on). */
++    auio_afe_wakenet_set(true);
++    ESP_LOGI(TAG, "KWS armed (standalone Hi Lexin)");
+     return OPRT_OK;
+ }
+ 
+ OPERATE_RET tkl_kws_disable(void)
+ {
+     sg_is_kws_enable = false;
+-
++    sg_wn_filled = 0;
++    /* LISTEN: stop spotting, enable AFE VAD for cloud ASR. */
++    auio_afe_wakenet_set(false);
+     return OPRT_OK;
+ }
+ 
+-OPERATE_RET tkl_kws_deinit(void)
++void tkl_kws_feed(const int16_t *samples, int n_samples)
+ {
+-    return OPRT_OK;
+-}
+-
+-
++    if (false == sg_is_kws_enable || NULL == sg_wn || NULL == sg_wn_data ||
++        NULL == sg_wn_buf || NULL == samples || n_samples <= 0) {
++        return;
++    }
+ 
++    static uint32_t s_samples;
++    static int32_t s_peak;     /* after gain (what WakeNet sees) */
++    static int32_t s_peak_in;  /* before gain (what the mic gives) */
++    static uint32_t s_clipped; /* samples that hit the int16 rails after gain */
++    static uint32_t s_detects;
++
++    int i = 0;
++    while (i < n_samples) {
++        int need = sg_wn_chunk - sg_wn_filled;
++        int take = n_samples - i;
++        if (take > need) {
++            take = need;
++        }
++        for (int k = 0; k < take; k++) {
++            int32_t in = samples[i + k];
++            int32_t ain = in < 0 ? -in : in;
++            if (ain > s_peak_in) {
++                s_peak_in = ain;
++            }
++            int32_t v = (int32_t)((float)in * sg_wn_gain);
++            if (v > 32767) {
++                v = 32767;
++                s_clipped++;
++            } else if (v < -32768) {
++                v = -32768;
++                s_clipped++;
++            }
++            sg_wn_buf[sg_wn_filled + k] = (int16_t)v;
++            int32_t a = v < 0 ? -v : v;
++            if (a > s_peak) {
++                s_peak = a;
++            }
++        }
++        sg_wn_filled += take;
++        i += take;
++
++        if (sg_wn_filled < sg_wn_chunk) {
++            continue;
++        }
++
++        int r = (int)sg_wn->detect(sg_wn_data, sg_wn_buf);
++        sg_wn_filled = 0;
++        s_detects++;
++        if (r > 0) {
++            ESP_LOGI(TAG, "KWS detected -> HEY_TUYA (standalone, r=%d peak_in=%d peak=%d)", r, (int)s_peak_in,
++                     (int)s_peak);
++            if (sg_wakeup_cb) {
++                sg_wakeup_cb(TKL_KWS_WAKEUP_HEY_TUYA);
++            }
++        }
++    }
+ 
++    /* 1 Hz breadcrumb (16000 samples): proves PCM reaches WakeNet while IDLE.
++     * Healthy: detects ~31/s (512-sample chunks), clipped == 0 while speaking. */
++    s_samples += (uint32_t)n_samples;
++    if (s_samples >= 16000u) {
++        ESP_LOGI(TAG, "wn feed: peak_in=%d peak=%d clipped=%u detects=%u gain=%.1f", (int)s_peak_in, (int)s_peak,
++                 (unsigned)s_clipped, (unsigned)s_detects, sg_wn_gain);
++        s_samples = 0;
++        s_peak = 0;
++        s_peak_in = 0;
++        s_clipped = 0;
++        s_detects = 0;
++    }
++}
+ 
++OPERATE_RET tkl_kws_deinit(void)
++{
++    sg_is_kws_enable = false;
++    if (sg_wn && sg_wn_data) {
++        sg_wn->destroy(sg_wn_data);
++        sg_wn_data = NULL;
++    }
++    if (sg_wn_buf) {
++        tkl_system_free(sg_wn_buf);
++        sg_wn_buf = NULL;
++    }
++    sg_wn = NULL;
++    return OPRT_OK;
++}

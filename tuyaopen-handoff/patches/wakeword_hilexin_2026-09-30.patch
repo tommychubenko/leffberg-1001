@@ -1,0 +1,614 @@
+diff --git a/apps/tuya.ai/your_chat_bot/src/app_chat_bot.c b/apps/tuya.ai/your_chat_bot/src/app_chat_bot.c
+index 73ec3202..70bfe343 100644
+--- a/apps/tuya.ai/your_chat_bot/src/app_chat_bot.c
++++ b/apps/tuya.ai/your_chat_bot/src/app_chat_bot.c
+@@ -141,7 +141,7 @@ OPERATE_RET app_chat_bot_init(void)
+     OPERATE_RET rt = OPRT_OK;
+ 
+     AI_CHAT_MODE_CFG_T ai_chat_cfg = {
+-        .default_mode = AI_CHAT_MODE_HOLD, // push-to-talk; idle low-power gates on this mode
++        .default_mode = AI_CHAT_MODE_WAKEUP, /* wake word + BOOT; 30 s listen after TTS */
+         .default_vol  = 50,
+         .evt_cb       = __ai_chat_handle_event,
+     };
+diff --git a/boards/ESP32/common/audio/tdd_audio_no_codec.c b/boards/ESP32/common/audio/tdd_audio_no_codec.c
+index 90917374..8aefa741 100644
+--- a/boards/ESP32/common/audio/tdd_audio_no_codec.c
++++ b/boards/ESP32/common/audio/tdd_audio_no_codec.c
+@@ -6,6 +6,7 @@
+  */
+ #include "math.h"
+ #include "string.h"
++#include "stdio.h"
+ 
+ #include "tdl_audio_driver.h"
+ #include "tdd_audio_no_codec.h"
+@@ -21,6 +22,7 @@
+ #include "tkl_gpio.h"
+ 
+ #include "audio_afe.h"
++#include "tkl_kws.h"
+ 
+ /***********************************************************
+ ************************macro define************************
+@@ -46,6 +48,44 @@
+ #define ENABLE_MIC_LOOPBACK_STATS 0
+ #endif
+ 
++/* Cheap "is the mic alive" log: 1 line/s with peak/rms/dc of the 16-bit mic stream. */
++#ifndef ENABLE_MIC_LEVEL_LOG
++#define ENABLE_MIC_LEVEL_LOG 0
++#endif
++
++/*
++ * High-pass the 16-bit mic stream before it reaches AFE/VAD, WakeNet and cloud ASR.
++ * Recorded shots (2026-09-30) showed the INMP441 path dominated by <300 Hz rumble and
++ * sub-10 Hz wander (breath/handling, room LF noise): 100 ms segments with rms ~1000 and
++ * zero zero-crossings. That garbage sets the level WakeNet normalises to and trips VAD.
++ * 2nd-order Butterworth, MIC_HPF_FC_HZ corner. Set 0 to bypass.
++ */
++#ifndef ENABLE_MIC_HPF
++#define ENABLE_MIC_HPF 1
++#endif
++#define MIC_HPF_FC_HZ (180.0f)
++
++/*
++ * Triggered PCM snapshot: when the 16-bit mic stream (exactly what WakeNet / ASR get)
++ * exceeds PCM_DUMP_TRIG_PEAK, keep 0.25 s pre-roll + 2 s and dump it as base64 lines
++ * "PCMD:<b64>" over UART from a low-priority task. PC side: decode -> 16 kHz mono WAV,
++ * listen / inspect spectrum. Set 0 once the mic path is trusted.
++ */
++#ifndef ENABLE_MIC_PCM_DUMP
++#define ENABLE_MIC_PCM_DUMP 0
++#endif
++#define PCM_DUMP_RATE       (16000)
++#define PCM_DUMP_PREROLL    (PCM_DUMP_RATE / 4)          /* 0.25 s */
++#define PCM_DUMP_SAMPLES    (PCM_DUMP_PREROLL + PCM_DUMP_RATE * 2) /* 2.25 s total */
++#define PCM_DUMP_TRIG_PEAK  (3500)
++#define PCM_DUMP_MAX_SHOTS  (3)
++#define PCM_DUMP_ARM_MS     (15000)                      /* skip boot chime / connect */
++
++/* One-shot speaker->mic frequency-response ladder 25 s after boot (diagnostic). */
++#ifndef ENABLE_MIC_FREQ_RESP_TEST
++#define ENABLE_MIC_FREQ_RESP_TEST 0
++#endif
++
+ /***********************************************************
+ ***********************typedef define***********************
+ ***********************************************************/
+@@ -228,6 +268,239 @@ static OPERATE_RET __spk_sd_init(ESP_I2S_HANDLE_T *hdl)
+     return OPRT_OK;
+ }
+ 
++#if ENABLE_MIC_HPF
++static struct {
++    float b0, b1, b2, a1, a2;
++    float x1, x2, y1, y2;
++    bool inited;
++} s_hpf;
++
++static void __mic_hpf_init(uint32_t fs)
++{
++    float w0 = 2.0f * 3.14159265f * MIC_HPF_FC_HZ / (float)fs;
++    float cw = cosf(w0), sw = sinf(w0);
++    float alpha = sw / (2.0f * 0.7071f);
++    float a0 = 1.0f + alpha;
++    s_hpf.b0 = ((1.0f + cw) * 0.5f) / a0;
++    s_hpf.b1 = (-(1.0f + cw)) / a0;
++    s_hpf.b2 = s_hpf.b0;
++    s_hpf.a1 = (-2.0f * cw) / a0;
++    s_hpf.a2 = (1.0f - alpha) / a0;
++    s_hpf.x1 = s_hpf.x2 = s_hpf.y1 = s_hpf.y2 = 0.0f;
++    s_hpf.inited = true;
++    PR_NOTICE("mic HPF: 2nd-order %d Hz @ %u Hz (applied on 24-bit data before the >>14 clip)", (int)MIC_HPF_FC_HZ,
++              (unsigned)fs);
++}
++
++/* One sample through the biquad; input/output in the same (24-bit) scale. */
++static inline float __mic_hpf_sample(float xin)
++{
++    float y = s_hpf.b0 * xin + s_hpf.b1 * s_hpf.x1 + s_hpf.b2 * s_hpf.x2 - s_hpf.a1 * s_hpf.y1 - s_hpf.a2 * s_hpf.y2;
++    s_hpf.x2 = s_hpf.x1;
++    s_hpf.x1 = xin;
++    s_hpf.y2 = s_hpf.y1;
++    s_hpf.y1 = y;
++    return y;
++}
++#endif /* ENABLE_MIC_HPF */
++
++#if ENABLE_MIC_FREQ_RESP_TEST
++/* Speaker -> mic acoustic frequency response: play a tone ladder through the amp and
++ * log, once per second, the mic amplitude at each ladder frequency (Goertzel). */
++#define FRT_NUM_FREQ (6)
++static const int s_frt_freq[FRT_NUM_FREQ] = {300, 500, 1000, 2000, 3000, 4000};
++static volatile bool s_frt_active = false;
++static struct {
++    float coeff[FRT_NUM_FREQ];
++    float s1[FRT_NUM_FREQ], s2[FRT_NUM_FREQ];
++    uint64_t sq;
++    uint32_t n;
++    bool inited;
++} s_frt;
++
++static void __frt_mic_feed(const int16_t *x, uint32_t n)
++{
++    if (!s_frt_active) {
++        return;
++    }
++    if (!s_frt.inited) {
++        for (int k = 0; k < FRT_NUM_FREQ; k++) {
++            s_frt.coeff[k] = 2.0f * cosf(2.0f * 3.14159265f * (float)s_frt_freq[k] / 16000.0f);
++        }
++        s_frt.inited = true;
++    }
++    for (uint32_t i = 0; i < n; i++) {
++        float v = (float)x[i];
++        s_frt.sq += (uint64_t)(x[i] * x[i]);
++        for (int k = 0; k < FRT_NUM_FREQ; k++) {
++            float s = v + s_frt.coeff[k] * s_frt.s1[k] - s_frt.s2[k];
++            s_frt.s2[k] = s_frt.s1[k];
++            s_frt.s1[k] = s;
++        }
++    }
++    s_frt.n += n;
++    if (s_frt.n >= 8000u) { /* 0.5 s windows */
++        int amp[FRT_NUM_FREQ];
++        for (int k = 0; k < FRT_NUM_FREQ; k++) {
++            float p = s_frt.s1[k] * s_frt.s1[k] + s_frt.s2[k] * s_frt.s2[k] - s_frt.coeff[k] * s_frt.s1[k] * s_frt.s2[k];
++            amp[k] = (int)(sqrtf(p < 0.0f ? 0.0f : p) * 2.0f / (float)s_frt.n);
++            s_frt.s1[k] = s_frt.s2[k] = 0.0f;
++        }
++        PR_NOTICE("mic resp: rms=%d | 300=%d 500=%d 1000=%d 2000=%d 3000=%d 4000=%d",
++                  (int)sqrt((double)s_frt.sq / (double)s_frt.n), amp[0], amp[1], amp[2], amp[3], amp[4], amp[5]);
++        s_frt.n = 0;
++        s_frt.sq = 0;
++    }
++}
++
++static OPERATE_RET __tdd_audio_no_codec_play(TDD_AUDIO_HANDLE_T handle, uint8_t *data, uint32_t len);
++
++static void __frt_task(void *arg)
++{
++    ESP_I2S_HANDLE_T *hdl = (ESP_I2S_HANDLE_T *)arg;
++    enum { N = 320 };
++    static int16_t buf[N];
++    tal_system_sleep(25000); /* after boot chime + connect alert */
++    PR_NOTICE("freq test: start (speaker tone ladder, mic Goertzel every 0.5 s)");
++    s_frt_active = true;
++    tal_system_sleep(1500); /* baseline noise */
++    for (int k = 0; k < FRT_NUM_FREQ; k++) {
++        PR_NOTICE("freq test: playing %d Hz", s_frt_freq[k]);
++        float ph = 0.0f, step = 2.0f * 3.14159265f * (float)s_frt_freq[k] / 16000.0f;
++        for (int blk = 0; blk < 16000 / N; blk++) { /* 1.0 s */
++            for (int i = 0; i < N; i++) {
++                buf[i] = (int16_t)(sinf(ph) * 6000.0f);
++                ph += step;
++                if (ph > 6.2831853f) {
++                    ph -= 6.2831853f;
++                }
++            }
++            __tdd_audio_no_codec_play(hdl, (uint8_t *)buf, sizeof(buf));
++        }
++        tal_system_sleep(1500);
++    }
++    s_frt_active = false;
++    PR_NOTICE("freq test: done");
++}
++#endif /* ENABLE_MIC_FREQ_RESP_TEST */
++
++#if ENABLE_MIC_PCM_DUMP
++static int16_t *s_pd_buf = NULL;      /* PCM_DUMP_SAMPLES, PSRAM */
++static int16_t s_pd_pre[PCM_DUMP_PREROLL];
++static uint32_t s_pd_pre_wr = 0;
++static uint32_t s_pd_fill = 0;        /* samples in s_pd_buf while capturing */
++static bool s_pd_capturing = false;
++static volatile bool s_pd_ready = false;
++static uint8_t s_pd_shots = 0;
++static THREAD_HANDLE s_pd_thrd = NULL;
++
++static void __pcm_dump_feed(const int16_t *x, uint32_t n)
++{
++    if (NULL == s_pd_buf || s_pd_ready) {
++        return;
++    }
++    if (!s_pd_capturing) {
++        /* keep pre-roll ring */
++        for (uint32_t i = 0; i < n; i++) {
++            s_pd_pre[s_pd_pre_wr] = x[i];
++            s_pd_pre_wr = (s_pd_pre_wr + 1u) % PCM_DUMP_PREROLL;
++        }
++        if (s_pd_shots >= PCM_DUMP_MAX_SHOTS || tal_system_get_millisecond() < PCM_DUMP_ARM_MS) {
++            return;
++        }
++        int32_t pk = 0;
++        for (uint32_t i = 0; i < n; i++) {
++            int32_t a = x[i] < 0 ? -x[i] : x[i];
++            if (a > pk) {
++                pk = a;
++            }
++        }
++        if (pk < PCM_DUMP_TRIG_PEAK) {
++            return;
++        }
++        /* trigger: unroll pre-roll (oldest first) into the linear buffer */
++        for (uint32_t i = 0; i < PCM_DUMP_PREROLL; i++) {
++            s_pd_buf[i] = s_pd_pre[(s_pd_pre_wr + i) % PCM_DUMP_PREROLL];
++        }
++        s_pd_fill = PCM_DUMP_PREROLL;
++        s_pd_capturing = true;
++        PR_NOTICE("pcm dump: triggered (peak %d), capturing 2 s", (int)pk);
++        return; /* current block is already in the pre-roll */
++    }
++    uint32_t room = PCM_DUMP_SAMPLES - s_pd_fill;
++    uint32_t take = n < room ? n : room;
++    memcpy(&s_pd_buf[s_pd_fill], x, take * sizeof(int16_t));
++    s_pd_fill += take;
++    if (s_pd_fill >= PCM_DUMP_SAMPLES) {
++        s_pd_capturing = false;
++        s_pd_ready = true;
++    }
++}
++
++static void __pcm_dump_task(void *arg)
++{
++    (void)arg;
++    static const char b64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
++    char line[6 + 96 + 2];
++    for (;;) {
++        if (!s_pd_ready) {
++            tal_system_sleep(100);
++            continue;
++        }
++        const uint8_t *p = (const uint8_t *)s_pd_buf;
++        uint32_t total = PCM_DUMP_SAMPLES * sizeof(int16_t);
++        PR_NOTICE("pcm dump: begin shot %u, %u bytes, 16 kHz s16le mono", (unsigned)(s_pd_shots + 1), (unsigned)total);
++        tal_system_sleep(50);
++        for (uint32_t off = 0; off < total; off += 72) {
++            uint32_t chunk = (total - off) < 72 ? (total - off) : 72;
++            int o = 0;
++            memcpy(line, "PCMD:", 5);
++            o = 5;
++            for (uint32_t i = 0; i < chunk; i += 3) {
++                uint32_t b0 = p[off + i];
++                uint32_t b1 = (i + 1 < chunk) ? p[off + i + 1] : 0;
++                uint32_t b2 = (i + 2 < chunk) ? p[off + i + 2] : 0;
++                uint32_t v = (b0 << 16) | (b1 << 8) | b2;
++                line[o++] = b64[(v >> 18) & 63];
++                line[o++] = b64[(v >> 12) & 63];
++                line[o++] = (i + 1 < chunk) ? b64[(v >> 6) & 63] : '=';
++                line[o++] = (i + 2 < chunk) ? b64[v & 63] : '=';
++            }
++            line[o++] = '\n';
++            line[o] = 0;
++            fputs(line, stdout);
++            if ((off / 72) % 16 == 15) {
++                tal_system_sleep(2); /* let other tasks log; UART is the bottleneck anyway */
++            }
++        }
++        fflush(stdout);
++        s_pd_shots++;
++        PR_NOTICE("pcm dump: end shot %u", (unsigned)s_pd_shots);
++        s_pd_ready = false;
++    }
++}
++
++static void __pcm_dump_init(void)
++{
++    s_pd_buf = (int16_t *)tal_psram_malloc(PCM_DUMP_SAMPLES * sizeof(int16_t));
++    if (NULL == s_pd_buf) {
++        PR_ERR("pcm dump: psram alloc failed");
++        return;
++    }
++    const THREAD_CFG_T cfg = {
++        .thrdname = "pcm_dump",
++        .stackDepth = 3072,
++        .priority = THREAD_PRIO_5,
++    };
++    if (tal_thread_create_and_start(&s_pd_thrd, NULL, NULL, __pcm_dump_task, NULL, &cfg) != OPRT_OK) {
++        PR_ERR("pcm dump: thread create failed");
++    } else {
++        PR_NOTICE("pcm dump: armed after %d ms, trigger peak>%d, max %d shots", PCM_DUMP_ARM_MS, PCM_DUMP_TRIG_PEAK,
++                  PCM_DUMP_MAX_SHOTS);
++    }
++}
++#endif /* ENABLE_MIC_PCM_DUMP */
++
+ static void esp32_i2s_read_task(void *args)
+ {
+     ESP_I2S_HANDLE_T *hdl = (ESP_I2S_HANDLE_T *)args;
+@@ -249,18 +522,82 @@ static void esp32_i2s_read_task(void *args)
+         // 32bit to 16bit
+         int32_t *p_raw_data = (int32_t *)(hdl->raw_data_buf);
+         int16_t *p_data = (int16_t *)(hdl->data_buf);
++#if ENABLE_MIC_HPF
++        if (!s_hpf.inited) {
++            __mic_hpf_init(hdl->cfg.mic_sample_rate ? hdl->cfg.mic_sample_rate : 16000u);
++        }
++#endif
+         for (int i = 0; i < samples; i++) {
+-            // Convert 32bit to 16bit
++            /* INMP441: 24-bit sample left-justified in the 32-bit Philips slot.
++             * Total gain is >>14 (x4 vs the usual >>16) so speech is loud enough for
++             * WakeNet; the HPF runs on the 24-bit value so LF rumble is removed *before*
++             * it can push the sample into the int16 rails. */
++#if ENABLE_MIC_HPF
++            float v = __mic_hpf_sample((float)(p_raw_data[i] >> 8)) * (1.0f / 64.0f);
++            int32_t tmp_value = (int32_t)v;
++#else
+             int32_t tmp_value = p_raw_data[i] >> 14;
+-            p_data[i] = (tmp_value > INT16_MAX)    ? INT16_MAX
+-                        : (tmp_value < -INT16_MAX) ? -INT16_MAX
+-                                                   : (int16_t)tmp_value;
++#endif
++            if (tmp_value > 32767) {
++                tmp_value = 32767;
++            } else if (tmp_value < -32768) {
++                tmp_value = -32768;
++            }
++            p_data[i] = (int16_t)tmp_value;
+         }
+ 
+ #if ENABLE_MIC_LOOPBACK_STATS
+         __mic_loopback_feed(hdl, p_data, samples);
+ #endif
+ 
++#if ENABLE_MIC_PCM_DUMP
++        __pcm_dump_feed(p_data, samples);
++#endif
++
++#if ENABLE_MIC_FREQ_RESP_TEST
++        __frt_mic_feed(p_data, samples);
++#endif
++
++#if ENABLE_MIC_LEVEL_LOG
++        /* 1 line per second: is the mic alive at all? raw0 = first untouched 32-bit sample
++         * (0x00000000 always -> no data on SD; 0xFFFFFFFF/-1 -> floating line). */
++        {
++            static uint32_t s_reads = 0, s_n = 0;
++            static int32_t s_pk = 0;
++            static uint64_t s_sq = 0, s_dsq = 0;
++            static int64_t s_sum = 0;
++            static int32_t s_prev = 0;
++            for (uint32_t i = 0; i < samples; i++) {
++                int32_t v = p_data[i];
++                int32_t a = (v < 0) ? -v : v;
++                if (a > s_pk) {
++                    s_pk = a;
++                }
++                s_sq += (uint64_t)(v * v);
++                int32_t d = v - s_prev; /* first difference = crude HF emphasis */
++                s_dsq += (uint64_t)(d * d);
++                s_prev = v;
++                s_sum += v;
++            }
++            s_n += samples;
++            if (++s_reads >= 100u && s_n) {
++                /* hf%: rms(diff)/rms(x) in %. 300 Hz tone ~12, speech 30-60, "sss" hiss / white noise >100.
++                 * Mic port blocked or muffled -> speech stays < 25. */
++                double rms = sqrt((double)s_sq / (double)s_n);
++                double drms = sqrt((double)s_dsq / (double)s_n);
++                PR_NOTICE("mic level: peak=%d rms=%d hfpct=%d dc=%d raw0=0x%08X", (int)s_pk, (int)rms,
++                          (int)(rms > 0.5 ? 100.0 * drms / rms : 0.0), (int)(s_sum / (int64_t)s_n),
++                          (unsigned)p_raw_data[0]);
++                s_reads = 0;
++                s_n = 0;
++                s_pk = 0;
++                s_sq = 0;
++                s_dsq = 0;
++                s_sum = 0;
++            }
++        }
++#endif
++
+         if (hdl->mic_cb) {
+             // Call the callback function with the read data
+             hdl->mic_cb(TDL_AUDIO_FRAME_FORMAT_PCM, TDL_AUDIO_STATUS_RECEIVING, hdl->data_buf,
+@@ -269,9 +606,12 @@ static void esp32_i2s_read_task(void *args)
+ 
+ #if defined(ENABLE_AUDIO_AFE) && (ENABLE_AUDIO_AFE == 1)
+         auio_afe_processor_feed(hdl->data_buf, samples * sizeof(int16_t));
++        /* Espressif WakeNet Hi Lexin вЂ” direct PCM path (virtual BOOT). */
++        tkl_kws_feed((const int16_t *)hdl->data_buf, (int)samples);
+ #endif
+ 
+-        tal_system_sleep(I2S_READ_TIME_MS);
++        /* Do not sleep after a successful blocking I2S read вЂ” that halves realtime
++         * rate and breaks WakeNet windowing while looking fine for coarse cloud ASR. */
+     }
+ }
+ 
+@@ -320,7 +660,7 @@ static void esp32_i2s_tone_task(void *args)
+             buf[2 * i] = s32;
+             buf[2 * i + 1] = s32;
+         }
+-        /* Hard mute in gaps — continuous noise here means SD wiring wrong. */
++        /* Hard mute in gaps вЂ” continuous noise here means SD wiring wrong. */
+         if (any_on != last_on) {
+             __spk_sd_set(hdl, any_on);
+             last_on = any_on;
+@@ -395,9 +735,26 @@ static OPERATE_RET __tdd_audio_no_codec_open(TDD_AUDIO_HANDLE_T handle, TDL_AUDI
+     }
+ #endif
+ 
++#if ENABLE_MIC_PCM_DUMP
++    __pcm_dump_init();
++#endif
++
++#if ENABLE_MIC_FREQ_RESP_TEST
++    {
++        THREAD_HANDLE frt_thrd = NULL;
++        const THREAD_CFG_T frt_cfg = {
++            .thrdname = "mic_frt",
++            .stackDepth = 4096,
++            .priority = THREAD_PRIO_3,
++        };
++        TUYA_CALL_ERR_LOG(tal_thread_create_and_start(&frt_thrd, NULL, NULL, __frt_task, (void *)hdl, &frt_cfg));
++    }
++#endif
++
+     const THREAD_CFG_T thread_cfg = {
+         .thrdname = "esp32_i2s_read",
+-        .stackDepth = 3072,
++        /* WakeNet detect() + the wake callback (player stop, alert) run on this task. */
++        .stackDepth = 6144,
+         .priority = THREAD_PRIO_1,
+     };
+     PR_DEBUG("I2S read task args: %p", hdl);
+@@ -447,14 +804,14 @@ static OPERATE_RET __tdd_audio_no_codec_play(TDD_AUDIO_HANDLE_T handle, uint8_t
+         volume = 50; /* keep startup tests audible */
+     }
+ 
+-    /* Mono int16 → stereo int16 L=R, chunked in internal RAM (matches 16-bit TX). */
++    /* Mono int16 в†’ stereo int16 L=R, chunked in internal RAM (matches 16-bit TX). */
+     enum { PLAY_FRAMES = 256 };
+     static int16_t s_dma_buf[PLAY_FRAMES * 2];
+ 
+     /*
+      * Content statistics of the *incoming* PCM (before volume), for COM diagnostics:
+-     *   peak / rms  — level; rms ~0 with peak>0 = mostly silence with clicks
+-     *   zc%         — zero-crossing rate. Speech/chime: ~5-20 %, 880 Hz sine: 11 %,
++     *   peak / rms  вЂ” level; rms ~0 with peak>0 = mostly silence with clicks
++     *   zc%         вЂ” zero-crossing rate. Speech/chime: ~5-20 %, 880 Hz sine: 11 %,
+      *                 white noise / garbage from a broken decode: ~50 %.
+      */
+     int32_t peak = 0;
+@@ -599,7 +956,7 @@ OPERATE_RET tdd_audio_no_codec_register(char *name, TDD_AUDIO_NO_CODEC_T cfg)
+     TUYA_CHECK_NULL_RETURN(_hdl, OPRT_MALLOC_FAILED);
+     memset(_hdl, 0, sizeof(ESP_I2S_HANDLE_T));
+     _hdl->cfg = cfg;
+-    /* GPIO0 is BOOT — treat unset/0 as "SD not software-controlled". */
++    /* GPIO0 is BOOT вЂ” treat unset/0 as "SD not software-controlled". */
+     if (_hdl->cfg.spk_sd_pin == TUYA_GPIO_NUM_0) {
+         _hdl->cfg.spk_sd_pin = TUYA_GPIO_NUM_MAX;
+     }
+diff --git a/src/ai_components/ai_main/src/ai_chat_main.c b/src/ai_components/ai_main/src/ai_chat_main.c
+index fd759e0d..bc3313a4 100755
+--- a/src/ai_components/ai_main/src/ai_chat_main.c
++++ b/src/ai_components/ai_main/src/ai_chat_main.c
+@@ -393,6 +393,12 @@ OPERATE_RET ai_chat_init(AI_CHAT_MODE_CFG_T *cfg)
+         is_need_save = true;
+     }
+ 
++    /* Product default wins over a stale NVS chat_mode (e.g. HOLD left from PTT demos). */
++    if (mode != (uint32_t)sg_ai_default_mode) {
++        mode = (uint32_t)sg_ai_default_mode;
++        is_need_save = true;
++    }
++
+     if(is_need_save) {
+         __ai_chat_save_config(mode, vol);
+     }
+diff --git a/src/ai_components/ai_mode/src/ai_mode_wakeup.c b/src/ai_components/ai_mode/src/ai_mode_wakeup.c
+index 11e92797..44d28355 100755
+--- a/src/ai_components/ai_mode/src/ai_mode_wakeup.c
++++ b/src/ai_components/ai_mode/src/ai_mode_wakeup.c
+@@ -12,6 +12,7 @@
+ #include "tuya_ai_agent.h"
+ 
+ #include "tkl_kws.h"
++#include "tkl_vad.h"
+ 
+ #if defined(ENABLE_LED) && (ENABLE_LED == 1)
+ #include "tdl_led_manage.h"
+@@ -58,18 +59,32 @@ static uint32_t        sg_wakeup_time_ms = AI_CHAT_WAKEUP_TIME_MS;
+ /***********************************************************
+ ***********************function define**********************
+ ***********************************************************/
+-static void __ai_mode_kws_wakeup(TKL_KWS_WAKEUP_WORD_E wakeup_word)
++/** Same path as BOOT wake: stop playback, alert, enter LISTEN. */
++static void __ai_mode_trigger_wake_listen(const char *reason)
+ {
+     ai_audio_player_stop(AI_AUDIO_PLAYER_ALL);
+     ai_audio_input_reset();
+     tuya_ai_agent_event(AI_EVENT_CHAT_BREAK, 0);
+ 
++    PR_NOTICE("ai_wakeup: %s -> LISTEN (virtual BOOT)", reason);
+     ai_audio_player_alert(AI_AUDIO_ALERT_WAKEUP);
+-
+     MODE_STATE_CHANGE(sg_mode_set_state, AI_MODE_STATE_LISTEN);
+     sg_is_wakeup = true;
+ }
+ 
++static void __ai_mode_kws_wakeup(TKL_KWS_WAKEUP_WORD_E wakeup_word)
++{
++    /* Espressif Hi Lexin = soft BOOT: only from IDLE (ignore while already chatting). */
++    if (sg_mode_set_state != AI_MODE_STATE_IDLE &&
++        sg_mode_set_state != AI_MODE_STATE_INIT) {
++        PR_NOTICE("ai_wakeup: KWS ignored (state not IDLE, word=%d)", (int)wakeup_word);
++        return;
++    }
++
++    PR_NOTICE("ai_wakeup: KWS Hi Lexin word=%d (acts as BOOT)", (int)wakeup_word);
++    __ai_mode_trigger_wake_listen("KWS");
++}
++
+ static void __ai_mode_enter_idle(void)
+ {
+ #if defined(ENABLE_LED) && (ENABLE_LED == 1)
+@@ -80,8 +95,11 @@ static void __ai_mode_enter_idle(void)
+ 
+     tal_sw_timer_stop(sg_enter_idle_timer);
+ 
+-    //disable wakeup
++    /* Do not capture-to-cloud in idle, but keep AFE/WakeNet fed for KWS. */
+     ai_audio_input_wakeup_set(false);
++    tkl_vad_start();
++    tkl_kws_enable();
++    PR_NOTICE("ai_wakeup: IDLE — KWS armed (say Hi Lexin)");
+ 
+     sg_is_wakeup = false;
+ }
+@@ -97,6 +115,8 @@ static void __ai_mode_enter_listen(void)
+     tal_sw_timer_start(sg_enter_idle_timer, sg_wakeup_time_ms, TAL_TIMER_ONCE);
+ 
+     sg_is_wakeup = true;
++    /* Stop KWS/WakeNet so AFE VAD can detect speech after BOOT or wake word. */
++    tkl_kws_disable();
+     ai_audio_input_wakeup_set(true);
+ }
+ 
+@@ -255,7 +275,13 @@ static OPERATE_RET __ai_mode_wakeup_handle_event(AI_NOTIFY_EVENT_T *event)
+         break;
+         case AI_USER_EVT_PLAY_CTL_END:
+         case AI_USER_EVT_PLAY_END:{
+-            MODE_STATE_CHANGE(sg_mode_set_state, (sg_is_wakeup == true)? AI_MODE_STATE_LISTEN : AI_MODE_STATE_IDLE);
++            /* After TTS/alert: reopen 30 s listen window.
++             * Only skip if user already cancelled to IDLE (don't bounce back). */
++            if (sg_mode_set_state == AI_MODE_STATE_IDLE) {
++                break;
++            }
++            MODE_STATE_CHANGE(sg_mode_set_state, AI_MODE_STATE_LISTEN);
++            sg_is_wakeup = true;
+         }
+         break;        
+         default:
+@@ -304,14 +330,21 @@ static OPERATE_RET __ai_mode_wakeup_handle_key(TDL_BUTTON_TOUCH_EVENT_E event, v
+ 
+     switch(event) {
+         case TDL_BUTTON_PRESS_SINGLE_CLICK: {
+-            ai_audio_player_stop(AI_AUDIO_PLAYER_ALL);
+-            ai_audio_input_reset();
+-            tuya_ai_agent_event(AI_EVENT_CHAT_BREAK, 0);
+-
+-            ai_audio_player_alert(AI_AUDIO_ALERT_WAKEUP);
+-
+-            MODE_STATE_CHANGE(sg_mode_set_state, AI_MODE_STATE_LISTEN);
+-            sg_is_wakeup = true;
++            /* Toggle: IDLE -> wake/LISTEN; any active state -> cancel to IDLE.
++             * Ambient VAD noise otherwise keeps restarting the 30 s session. */
++            if (sg_mode_set_state != AI_MODE_STATE_IDLE &&
++                sg_mode_set_state != AI_MODE_STATE_INIT) {
++                /* Arm IDLE before player_stop so sync PLAY_END cannot bounce to LISTEN. */
++                PR_NOTICE("ai_wakeup: BOOT cancel -> IDLE");
++                MODE_STATE_CHANGE(sg_mode_set_state, AI_MODE_STATE_IDLE);
++                sg_is_wakeup = false;
++                ai_audio_player_stop(AI_AUDIO_PLAYER_ALL);
++                ai_audio_input_reset();
++                tuya_ai_agent_event(AI_EVENT_CHAT_BREAK, 0);
++                break;
++            }
++
++            __ai_mode_trigger_wake_listen("BOOT");
+         }
+         break;
+         default:

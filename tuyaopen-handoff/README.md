@@ -1,18 +1,160 @@
 # Leffberg AI Speaker (ESP32-S3 + TuyaOpen)
 
-Документ фіксує ідею проєкту, зроблено, результати, висновки й поточний стан (оновлено **2026-09-29**).
+Документ фіксує ідею проєкту, зроблено, результати, висновки й поточний стан (оновлено **2026-09-30 ~21:30**).
 
 ---
 
-## ГОЛОВНЕ на зараз (2026-09-29, вечір) — читати першим
+## СТАБІЛЬНА ВЕРСІЯ 2026-09-30 (wake word працює) — читати першим
 
-1. **MVP голосу працює** (підтверджено користувачем ~22:10): BOOT → ASR → TTS **чути рівно**, без скрипу і без ривків; ding-dong теж. Цифровий шлях був доведений 24-го; живий звук з’явився після пайки **+/−** і **GAIN 3V3 (6 dB)**.
-2. **Скрип** = занадто великий GAIN (12 dB на GND). **Ривки** = дві програмні причини, обидві виправлені: UART-дамп TTS гальмував feed (~425 мс dump на 216 мс звуку) + у `svc_ai_player` не було jitter-буфера (старт з першого байта, DMA ~90 мс). Pre-buffer **3 КБ / 1.5 с**.
-3. **Не чіпати** без нової скарги: I2S 16-bit Philips, MP3 reservoir/frame-skip, GAIN 3V3, SD GPIO17.
-4. **Далі — продукт, не «чи є звук»:** закомітити uncommitted TuyaOpen (`svc_ai_player`, prebuf, макроси=0); «чиста» прошивка (floor volume, connect-alert); DP 206; корпус/BOM/wake word за бажанням.
-5. Діагностика (silence/selftest/loopback/TTS dump) **вже вимкнена** в поточній збірці на платі.
+### Що працює на платі
 
-Деталі фіксів ривків — блок нижче в цьому розділі; ніч 24-го — «Тести 2026-09-24».
+1. **Wake word «Hi Lexin»** (Espressif WakeNet9 `wn9_hilexin`, standalone, годується з I2S read task) → `KWS detected -> HEY_TUYA` → **virtual BOOT → LISTEN** → мова → ASR → відповідь TTS. Підтверджено логом COM4 після перевороту мікрофона:
+   `tkl_kws: KWS detected -> HEY_TUYA (standalone, r=1 peak_in=11763 peak=23526)` → `ai_wakeup: KWS Hi Lexin word=3 (acts as BOOT)` → `KWS -> LISTEN (virtual BOOT)`.
+2. **Голос (діалог):** mic → ASR → хмара → TTS → динамік — ок; TTS рівний (pre-buffer 3 КБ).
+3. **BOOT як toggle у `AI_CHAT_MODE_WAKEUP`:** IDLE → BOOT → LISTEN → THINK → SPEAK → знову LISTEN ~30 с (follow-up); BOOT під час сесії → cancel → IDLE.
+4. Tuya on-device KWS **не** використовується. «Hey Tuya» ця прошивка **не** розпізнає — у flash лише `wn9_hilexin`; `HEY_TUYA` — лише назва колбека.
+
+### Чому wake не працював раніше (корінь)
+
+**Порт INMP441 дивився в стіл/бредборд.** Спектр мови обрізався ~600 Hz (FFT PCM‑знімків: > 1.5 kHz ≈ 0 %), голосні ще витягував хмарний ASR, а WakeNet без приголосних не детектив нічого. Софт‑тракт (модель, feed, рейт 16 kHz, gain) при цьому був справний — це доведено тестом «динамік → мікрофон». **Після перевороту мікрофона отвором у повітря — детекція запрацювала одразу**, без змін коду.
+
+### Коміти стабільної версії
+
+| Репозиторій | Коміт / гілка / тег | Що всередині |
+|-------------|--------------------|--------------|
+| `D:\esp32\TuyaOpen` (master, локально; origin = tuya/TuyaOpen, туди не пушимо) | **`760d198a`**, тег `stable-2026-09-30-wakeword` (поверх `46f6e383` аудіо‑фіксів) | `tdd_audio_no_codec.c` (feed KWS, HPF 180 Hz, стек 6144, діагностика off), `ai_mode_wakeup.c`, `ai_chat_main.c`, `app_chat_bot.c` |
+| `D:\esp32\TuyaOpen\platform\ESP32` (гілка **`leffberg-audio`**, origin = tuya/TuyaOpen-esp32) | **`29eb874`**, тег `stable-2026-09-30-wakeword` (поверх `a934eed`) | `tkl_kws.c` (standalone WN, gain 2.0), `tkl_kws.h`, `audio_afe.c/.h` (VAD‑only) |
+| Handoff `D:\esp32\1003` (github.com/tommychubenko/leffberg-1001, main) | коміт цього README + `patches/*2026-09-30.patch`, тег `stable-2026-09-30` | Патчі для відтворення на чистому TuyaOpen |
+
+Патчі: `patches/wakeword_hilexin_2026-09-30.patch` (TuyaOpen, `git apply` поверх `46f6e383`), `patches/platform_esp32_kws_afe_2026-09-30.patch` (platform/ESP32, поверх `a934eed`). Раніші патчі (аудіо 09‑24, pre-buffer 09‑29) лишаються актуальними. `tuya_config.h` з UUID/AuthKey **не в git** (є `config/tuya_config.h.example`).
+
+### Стан макросів у стабільній збірці (`tdd_audio_no_codec.c` / `tkl_kws.c`)
+
+| Макрос | Значення | Роль |
+|--------|----------|------|
+| `ENABLE_MIC_HPF` / `MIC_HPF_FC_HZ` | **1 / 180** | HPF 2‑го порядку на 24‑бітних даних до `>>14`: шум спокою 900 → ~90, DC‑дрейф прибрано. **Лишити.** |
+| `TKL_KWS_GAIN` | **2.0** | Замість `get_vol_gain` (~10×, кліпінг). Норма в `wn feed`: `clipped=0`, `detects≈31`. |
+| стек `esp32_i2s_read` | **6144** | у ньому працює `detect()` + колбек |
+| `ENABLE_MIC_LEVEL_LOG` | 0 | діагностика (peak/rms/hfpct 1 Гц) — вмикати лише для розбору мікрофона |
+| `ENABLE_MIC_PCM_DUMP` | 0 | PCM‑знімки base64 → `%TEMP%\pcmd_to_wav.py` |
+| `ENABLE_MIC_FREQ_RESP_TEST` | 0 | сходинки тонів динамік → мікрофон (Goertzel) |
+| `ENABLE_MIC_LOOPBACK_STATS`, `ENABLE_I2S_TONE_TEST` | 0 | стара діагностика |
+| лог `wn feed: …` 1 Гц | увімкнено | єдиний «пульс» KWS у стабільній збірці; корисний і в полі |
+
+Перевірка стабільної збірки після прошивки (`com4_stable_boot.log`): `mic HPF: 2nd-order 180 Hz @ 16000 Hz`, `standalone WakeNet ready … gain=2.0`, `KWS armed (standalone Hi Lexin)`, `wn feed: … clipped=0 detects=31`, без `mic level` / `pcm dump`.
+
+### Не чіпати без нової скарги
+
+I2S TX 16-bit Philips L=R, MP3 reservoir/frame-skip, GAIN 3V3, SD GPIO17, TTS pre-buffer 3 КБ, HPF 180 Hz, KWS gain 2.0, **орієнтація INMP441 — отвір у повітря, не в плату**.
+
+### Наступні кроки (після стабільної)
+
+1. Корпус: отвір під мікрофон навпроти порту INMP441; мікрофон подалі від динаміка.
+2. Оцінити false‑wake у побуті (лог `KWS detected` без мови); за потреби підняти threshold 0.40 → 0.5 у `tkl_kws.c`.
+3. Опційно: пуш коду TuyaOpen/platform у форки на GitHub (зараз код — лише локальні коміти + патчі в handoff).
+
+---
+
+## Архів: стан на 2026-09-30 ~00:45 (до знаходження причини)
+
+### Працювало
+
+1. **Голос (діалог):** mic → ASR → хмара → TTS → динамік — ок після фіксу контактів INMP441 і аудіо-шляху.
+2. **BOOT як PTT/toggle у `AI_CHAT_MODE_WAKEUP`:**
+   - IDLE → BOOT → LISTEN (alert) → мова → THINK → SPEAK;
+   - після кінця TTS знову **LISTEN ~30 с** (follow-up без повторного wake);
+   - BOOT під час сесії → cancel → IDLE.
+3. **Архітектура wake (задум):** Tuya on-device KWS **не** використовуємо. В IDLE — **Espressif WakeNet `wn9_hilexin`**; детекція має = **virtual BOOT** (той самий шлях, що кнопка).
+
+### Тоді не працювало
+
+4. **Wake word Hi Lexin — НЕ спрацьовував.** У логах **0** × `KWS detected` / `wakeword detected` при багатьох спробах. (Розв'язано 30.09 увечері — див. вище.)
+5. Мікрофон при цьому **живий**: в IDLE піки ростуть, коли говориш; standalone WN їсть PCM (`wn feed: … detects≈16/s`).
+6. Модель у flash: `wn9_hilexin`, word1 = **`嗨，乐鑫`**, rate=16000, chunk=512. Колбек заплановано як `HEY_TUYA` (бренд), акустика — Hi Lexin.
+
+---
+
+## Wake word — сесія 2026-09-29/30 (історія; результат — у блоці «СТАБІЛЬНА ВЕРСІЯ» вище)
+
+### Цільова схема (погоджено)
+
+```
+IDLE:  Espressif WN9_HILEXIN ("Hi Lexin") ──detect──► virtual BOOT → LISTEN → … діалог
+LISTEN: WakeNet OFF; AFE VAD ON → cloud ASR
+BOOT:   той самий шлях LISTEN / cancel (toggle)
+```
+
+Tuya wake-фразу / хмарний KWS **не** використовуємо. On-device лише Espressif.
+
+### Що змінили в коді (закомічено 30.09: TuyaOpen `760d198a`, platform/ESP32 `29eb874`)
+
+| Зміна | Навіщо |
+|-------|--------|
+| Дефолт `AI_CHAT_MODE_WAKEUP`, force mode у firmware | Режим wake замість HOLD з NVS |
+| BOOT toggle IDLE↔cancel; після TTS → LISTEN 30 с | UX; фікс follow-up після «привіт» |
+| `tkl_kws.c`: **standalone WakeNet** (`esp_wn_*`), `tkl_kws_feed()` з I2S | Обхід AFE-гейту; Hi Lexin → `HEY_TUYA` → virtual BOOT |
+| AFE: `wakenet_init=false`, VAD лише для LISTEN | Розділення KWS / ASR |
+| `srmodels`: `wn9_hilexin` (UTF-8 build), flash `0xed0000` | Модель у partition `model` |
+| Mic PCM: було `>>16`, зараз **`>>14`** (WN digital gain: ~10× → **2.0** фіксовано 30.09) + HPF 180 Hz | Гучніший сигнал для WN без кліпінгу |
+| DET threshold 0.40, DET_MODE_95 (коли був AFE-WN) | Чутливість |
+
+Ключові файли: `tkl_kws.c`, `audio_afe.c`, `ai_mode_wakeup.c`, `tdd_audio_no_codec.c`, sdkconfig HILEXIN.
+
+### Що підтвердили логами (COM4)
+
+| Факт | Доказ |
+|------|--------|
+| Модель завантажена | `standalone WakeNet ready: model=wn9_hilexin word1=嗨，乐鑫 chunk=512 rate=16000` |
+| KWS armed в IDLE | `KWS armed (standalone Hi Lexin)` |
+| PCM доходить до WN | `wn feed: peak=… detects=15..16 gain=10.0 armed=1` (~кожну секунду) |
+| Голос чути міком | `afe feed` / `wn feed` peak скаче (тисячі → 10k–32k при мові) |
+| BOOT = virtual wake | `BOOT -> LISTEN (virtual BOOT)` + ASR + SPEAK |
+| Follow-up після TTS | LISTEN після PLAY_END (після фіксу race з `sg_is_wakeup`) |
+| **Детекція wake** | **`KWS detected` = 0** на всіх зйомках |
+
+### Що пробували і не допомогло для Hi Lexin
+
+- AFE pipeline з WakeNet + VAD / без VAD / `disable_wakenet` у LISTEN;
+- `DET_MODE_95`, threshold 0.40;
+- digital gain ×4 / ×8 / `get_vol_gain` (~10);
+- mic shift `>>16` → `>>14`;
+- standalone `esp_wn_iface` напряму на PCM (поза AFE).
+
+### Відкрита проблема (станом на ранок 30.09 — закрита увечері)
+
+WakeNet **ініціалізований і годується**, але **ніколи не повертає detect>0** на «Hi Lexin». Можливі напрямки далі: вимова/акцент vs тренування `嗨，乐鑫`, якість/спектр INMP441 після shift, альтернативна модель/кастомна фраза Espressif, або тимчасово лишити лише BOOT.
+
+Критерій успіху wake: у логу `KWS detected -> HEY_TUYA` і одразу `… -> LISTEN (virtual BOOT)` без натискання BOOT. **Досягнуто 30.09 ~20:50** (див. нижче і блок «СТАБІЛЬНА ВЕРСІЯ»).
+
+### Сесія 2026-09-30 (вечір) — що знайдено інструментально
+
+Стан на момент паузи (~20:25): **корінь — фізика мікрофона**, софт‑тракт до WakeNet перевірений і чистий.
+
+| Крок | Факт |
+|------|------|
+| На платі стояла прошивка 23:58 (не остання) | `KWS armed`, але **жодного `wn feed`** → PCM до WakeNet взагалі не доходив |
+| `tkl_kws.c`: `get_vol_gain(-25 dB)` одразу після `create()` | Повертав ~10× → кліпінг кожного слова. Замінено на фіксований `TKL_KWS_GAIN 2.0`; лог `wn feed: peak_in/peak/clipped/detects` (1 Гц, норма `detects≈31`, `clipped=0`) |
+| Стек `esp32_i2s_read` 3072 → 6144 | у ньому крутиться `detect()` + колбек wake |
+| PCM‑знімки (`ENABLE_MIC_PCM_DUMP`, `PCMD:` base64 → `%TEMP%\pcmd_to_wav.py`) | Сигнал спокою: 90 % енергії < 300 Hz, «плаваючий» DC (100‑мс відрізки з rms~1000 і 0 перетинів нуля) → **HPF 180 Hz 2‑го порядку** на 24‑бітних даних до `>>14` (`ENABLE_MIC_HPF`). Шум спокою 900 → **~90** (rms 22, білий), кліпінгу немає |
+| Тест «динамік → мікрофон» (`ENABLE_MIC_FREQ_RESP_TEST`, сходинки 300…4000 Hz) | 300:75 500:204 1000:760 2000:1043 3000:595 4000:389 — кожен тон точно у своєму біні: **рейт 16 kHz точний, мікрофон бачить 2–4 kHz** |
+| FFT записів «Хай Лешін» (з 0.5–1 м) | 700–1500 Hz ≤ 2 %, > 1500 Hz ≈ 0 % — **мова обрізана ~600 Hz**, приголосних немає. WakeNet із такого не розпізнає нічого; хмарний ASR ще витягує за голосними |
+| Причина | **Порт INMP441 дивився в стіл/бредборд** (підтверджено користувачем). Тест динаміком пройшов, бо вібрація йде через плату прямо в корпус мікрофона |
+
+**Результат (~20:50):** користувач перевернув INMP441 отвором у повітря — **«Хай Лешін» спрацьовує**, лог: `KWS detected -> HEY_TUYA (standalone, r=1 peak_in=11763 peak=23526)` → `KWS Hi Lexin word=3 (acts as BOOT)` → `KWS -> LISTEN (virtual BOOT)` → `state change form IDLE to LISTEN`. У `mic level` під час мови `peak≈29000 rms≈3000 hfpct≈58` (раніше в «стіл» — мова без ВЧ). Контрольний варіант через AFE (`wakenet_init=true`) не знадобився.
+
+**Стабільна збірка (~21:15):** вимкнено `ENABLE_MIC_LEVEL_LOG`, `ENABLE_MIC_PCM_DUMP` (`ENABLE_MIC_FREQ_RESP_TEST` уже 0); лишено `ENABLE_MIC_HPF 1`, `TKL_KWS_GAIN 2.0`, стек 6144, `wn feed` 1 Гц. Зібрано, прошито, boot‑лог чистий (`com4_stable_boot.log`). Закомічено: TuyaOpen `760d198a`, platform/ESP32 `29eb874` (гілка `leffberg-audio`), обидва з тегом `stable-2026-09-30-wakeword`. «Hey Tuya» ця прошивка не розпізнає в принципі — у flash лише `wn9_hilexin`; `HEY_TUYA` — назва колбека.
+
+---
+
+## ГОЛОВНЕ (архів 2026-09-29, ~23:40) — попередній зріз
+
+1. **Стабільний голос ок** (BOOT PTT / toggle): mic/ASR/TTS після фіксу контактів INMP441.
+2. **Режим `AI_CHAT_MODE_WAKEUP`**: акустика **Hi Lexin** (`wn9_hilexin`); колбек **`HEY_TUYA`**. Рідний Tuya ESP32 був би «你好小智»; «Hey Tuya» публічно немає. **Хмара Tuya не керує on-device WakeNet.**
+3. **WakeNet Espressif:** **Hi Lexin** — безкоштовний для комерції; своя фраза — платний кастом.
+4. **Не чіпати** без нової скарги: I2S 16-bit Philips, MP3 reservoir/frame-skip, GAIN 3V3, SD GPIO17, pre-buffer 3 КБ.
+5. **Тоді в роботі:** on-device KWS; у логах шукати `wakeword detected` / `KWS detected`. (Закрито 30.09 — див. початок документа.)
+
+Деталі фіксів ривків — блок нижче; ніч 24-го — «Тести 2026-09-24».
 
 **Оновлення 2026-09-29 (пізно) — ривки: дві причини знайдено в коді, обидві виправлено, прошито:**
 
@@ -25,9 +167,9 @@
 
 ---
 
-## Нотатки наступному агенту (2026-09-29, після фіксу)
+## Нотатки наступному агенту (2026-09-30)
 
-Аудіо-MVP **закрито**. Не відкривати знову «empty TTS», «32-bit I2S», «бітрейт 32k», «GAIN на GND».
+Аудіо-MVP **закрито**. Wake word **закрито 30.09 увечері** (причина — орієнтація мікрофона; див. «СТАБІЛЬНА ВЕРСІЯ»). Не відкривати знову «empty TTS», «32-bit I2S», «бітрейт 32k», «GAIN на GND», «WakeNet не детектить при живому feed».
 
 ### Що вважати готовим
 
@@ -39,20 +181,24 @@
 | I2S Philips 16-bit L=R | Працює |
 | Amp MAX98357, GAIN 3V3, SD GPIO17, динамік паяний | Працює |
 | Рівний TTS (без ривків) | Працює після вимкнення dump + pre-buffer |
+| BOOT toggle + follow-up LISTEN 30 с | Працює |
+| Espressif Hi Lexin → virtual BOOT | **Працює** (мікрофон отвором у повітря; HPF 180 Hz; gain 2.0) |
 
 ### Не чіпати
 
-I2S формат, MP3-фікси, GAIN 3V3, UUID у git. Pre-buffer (`AI_PLAYER_STREAM_PREBUF_BYTES` 3072) — лишити, поки звук рівний.
+I2S формат TX, MP3-фікси, GAIN 3V3, HPF 180 Hz, KWS gain 2.0, орієнтація INMP441, UUID у git. Pre-buffer (`AI_PLAYER_STREAM_PREBUF_BYTES` 3072) — лишити, поки звук рівний.
 
-### Наступний етап (продукт)
+### Наступний етап
 
-1. Закомітити TuyaOpen поверх `a0f1a516`: `svc_ai_player.c/.h`, `ai_player.h`, макроси діагностики=0, stall-лог. Оновити `patches/`. `tuya_config.h` з ключами — **ні**. Platform I2S уже в `a934eed` (detached HEAD — оформити гілку, якщо треба push).
-2. «Чиста» прошивка: прибрати floor `volume<50→50`; обрати один connect-sound (PCM chime vs MP3 dingdong); `default_vol` як у продукті.
-3. Платформа Tuya: DP **206** Delete, якщо не BT.
-4. Залізо на потім: конденсатори на Vin, коротші I2S, корпус, BOM, wake word.
-5. Якщо знову ривки — спочатку лог `stall` / `prebuffer ready`, не зміна бітності I2S.
+1. ~~Wake word~~ — зроблено 30.09 (`760d198a` / `29eb874`).
+2. ~~Закомітити TuyaOpen, оновити `patches/`~~ — зроблено 30.09. `tuya_config.h` з ключами — як і раніше **не в git**.
+3. «Чиста» прошивка: floor volume; один connect-sound (зараз PCM chime); діагностика вже 0.
+4. Платформа Tuya: DP **206** Delete, якщо не BT.
+5. Залізо: корпус з отвором під мікрофон, конденсатори на Vin, коротші I2S, BOM.
+6. Поле: поспостерігати false‑wake (`KWS detected` без мови); threshold 0.40 в `tkl_kws.c` за потреби.
 
-Критерій «можна продавати як демо»: тиша в простої, ding-dong, BOOT → рівна відповідь, пара Smart Life жива.
+Критерій демо без wake: тиша в простої, ding-dong, BOOT → рівна відповідь + follow-up, Smart Life жива.  
+Критерій демо з wake: те саме + `KWS detected` на Hi Lexin — **виконано 30.09**.
 
 ---
 
@@ -104,7 +250,7 @@ I2S формат, MP3-фікси, GAIN 3V3, UUID у git. Pre-buffer (`AI_PLAYER_
 
 | Функція | Пін |
 |---------|-----|
-| Talk | кнопка **BOOT** (GPIO0), режим hold |
+| Talk | кнопка **BOOT** (GPIO0), wake-mode toggle + запасний PTT |
 | Статус | вбудований RGB **GPIO48** |
 
 > **SD = GPIO17.** У простої прошивка тримає його LOW. HIGH лише на час play / SPEAK.
@@ -138,7 +284,7 @@ I2S формат, MP3-фікси, GAIN 3V3, UUID у git. Pre-buffer (`AI_PLAYER_
 
 ### Базове
 - TuyaOpen `your_chat_bot`, board `ESP32S3_BREAD_COMPACT_WIFI`.
-- OLED вимкнено; чат **AI_CHAT_MODE_HOLD**.
+- OLED вимкнено; чат **`AI_CHAT_MODE_WAKEUP`** (BOOT toggle + Hi Lexin-задум; після TTS знову LISTEN **30 с**). HOLD більше не дефолт.
 - Flash додатка з `0x10000` (`esptool`), без wipe пари Smart Life (коли можливо).
 - **SD‑mute** на GPIO17.
 
@@ -270,6 +416,8 @@ I2S формат, MP3-фікси, GAIN 3V3, UUID у git. Pre-buffer (`AI_PLAYER_
 | Постійний писк у простої | Прибрано (SD‑mute), коли SD на GPIO17 |
 | Скрип на корисному звуці | **GAIN 12 dB**; знято **GAIN 3V3 = 6 dB** |
 | Потік TTS | **Рівний** після вимкнення dump + pre-buffer (підтверджено 2026-09-29 22:10) |
+| BOOT wake + follow-up | **Працює** (2026-09-30) |
+| Espressif Hi Lexin (on-device) | **НЕ працює** — 0 детекцій при живому `wn feed` |
 
 ### Як орієнтуватись (важливо)
 
@@ -319,22 +467,23 @@ I2S формат, MP3-фікси, GAIN 3V3, UUID у git. Pre-buffer (`AI_PLAYER_
 1. При старті / connect — **впізнаваний** звук, тиша в простої. *(Досягнуто.)*
 2. BOOT → питання → **рівна** відповідь без скрипу і ривків. *(Досягнуто 2026-09-29.)*
 3. Надійна механіка (конденсатори, короткі I2S, корпус) — **наступний шар заліза**.
-4. Опційно wake word, BOM, «чиста» прошивка без test-floor гучності.
+4. Опційно **робочий** wake word (зараз лише код/модель, детекція ні), BOM, «чиста» прошивка без test-floor гучності.
 
 ---
 
 ## Наступні кроки
 
-1. Закомітити TuyaOpen (pre-buffer, макроси=0, stall) **без** `tuya_config.h`; оновити `patches/`.
-2. «Чиста» прошивка: floor volume, один connect-alert.
-3. DP 206 на платформі; конденсатори на Vin за бажанням.
-4. Wake word / корпус — після стабільної чистої збірки.
+1. **Добити Hi Lexin** (або задокументувати «тільки BOOT»): лог `KWS detected` обов’язковий для закриття wake.
+2. Закомітити TuyaOpen (pre-buffer, wakeup UX, standalone `tkl_kws`, mic `>>14`) **без** `tuya_config.h`; оновити `patches/`.
+3. «Чиста» прошивка: floor volume, один connect-alert, diag macros=0.
+4. DP 206 на платформі; конденсатори на Vin за бажанням.
+5. Корпус / BOM — після стабільної чистої збірки.
 
 ---
 
 ## Висновок і пропозиції (що лишити / що вимкнути)
 
-**Висновок (2026-09-29 вечір):** колонка як AI-спікер **працює**. Скрип і ривки закриті. Далі — коміт, чиста збірка, продукт.
+**Висновок (2026-09-30):** колонка як AI-спікер **працює через BOOT**. Скрип і ривки закриті. **Wake word Hi Lexin — відкрита проблема** (модель/PCM ок, detect=0). Далі — KWS або «тільки BOOT», коміт, чиста збірка.
 
 ### Залишити назавжди (продукт)
 
@@ -346,10 +495,11 @@ I2S формат, MP3-фікси, GAIN 3V3, UUID у git. Pre-buffer (`AI_PLAYER_
 6. mono→stereo + play чанками в internal RAM
 7. Фікси MP3: **reservoir** (`minimp3.h`) + **frame‑skip** (`decoder_mp3.c`)
 8. PCM chime чанками на стеку (без великого `malloc`)
-9. `default_vol = 50`, режим HOLD
+9. `default_vol = 50`, режим **WAKEUP** (BOOT + Hi Lexin-задум; HOLD більше не дефолт)
 10. cmake fallback у `cli_prepare.py`
 11. **Pre-buffer TTS** у `svc_ai_player` (3 КБ / 1.5 с) — лишити
 12. Діагностичні макроси **0** у продуктовій збірці
+13. Standalone Espressif WN у `tkl_kws` (поки без успішної детекції)
 
 ### Вимкнути перед «чистою» прошивкою (діагностика)
 
@@ -388,13 +538,20 @@ I2S формат, MP3-фікси, GAIN 3V3, UUID у git. Pre-buffer (`AI_PLAYER_
 | Audio play / SD mute | `boards/ESP32/common/audio/tdd_audio_no_codec.c` |
 | I2S TX format | `platform/ESP32/tuya_open_sdk/tuyaos_adapter/src/drivers/tkl_i2s.c` |
 | Alerts / PCM chime / boot‑діагностика | `src/ai_components/ai_audio/src/ai_audio_player.c` |
+| Wake mode / virtual BOOT | `src/ai_components/ai_mode/src/ai_mode_wakeup.c` |
+| Standalone Hi Lexin KWS | `platform/ESP32/.../audio/tkl_kws.c` (+ `tkl_kws_feed` з `tdd_audio_no_codec.c`) |
+| AFE VAD (LISTEN) | `platform/ESP32/.../audio/audio_afe.c` |
 | MP3 декодер | `src/audio_player/src/decoder/decoder_mp3.c`, `…/minimp3/minimp3.h` |
-| Захоплення COM4 | `%TEMP%\cap_com4.py <log> <сек> [noreset]` (RTS‑reset, фільтр ключових рядків) |
+| Захоплення COM4 | `%TEMP%\cap_com4.py <log> <сек> [noreset]`; live KWS: `%TEMP%\mon_kws.py` |
 | Дамп TTS → MP3 на ПК | `D:\esp32\1003\dump_tts.py` → `tts_dumps\tts_NNN.mp3` (`ENABLE_TTS_UART_DUMP`) |
-| Прошивка (без wipe пари) | `esptool --chip esp32s3 -p COM4 -b 921600 write_flash 0xd000 .build\bin\ota_data_initial.bin 0x10000 .build\bin\your_chat_bot.bin` |
+| Прошивка app | `esptool … write_flash 0xd000 ota_data_initial.bin 0x10000 your_chat_bot.bin` |
+| Прошивка + srmodels | … + `0xed0000 .build\bin\srmodels.bin` (після зміни WakeNet моделі) |
 | Board SD pin | `boards/ESP32/ESP32S3_BREAD_COMPACT_WIFI/esp32s3_bread_compact_wifi.c` |
 | Agent Runtime Logs | https://developer.tuya.com/en/docs/iot/ai-agent-trace?id=Kfa18iwxmkeh5 |
 | Патчі аудіо‑шляху (2026‑09‑24) | `patches/audio_path_2026-09-24.patch`, `patches/platform_esp32_tkl_i2s_2026-09-24.patch` |
+| Патч pre-buffer TTS (2026‑09‑29) | `patches/stutter_prebuffer_2026-09-29.patch` |
+| Патчі wake word (2026‑09‑30, стабільна) | `patches/wakeword_hilexin_2026-09-30.patch` (TuyaOpen), `patches/platform_esp32_kws_afe_2026-09-30.patch` (platform/ESP32) |
+| PCM‑знімки мікрофона → WAV | `%TEMP%\pcmd_to_wav.py <log> <prefix> [--bands]` (потрібен `ENABLE_MIC_PCM_DUMP 1`) |
 | Continue | [`CONTINUE.md`](./CONTINUE.md) |
 | Секрети | `secrets.local.md` (не комітити) |
 
@@ -402,4 +559,4 @@ I2S формат, MP3-фікси, GAIN 3V3, UUID у git. Pre-buffer (`AI_PLAYER_
 
 ## Підсумок одним реченням
 
-**ПРАЦЮЄ (підтверджено користувачем 2026‑09‑29 22:10): mic/ASR/TTS ок, голос і ding-dong чути рівно, без скрипу і ривків. Скрип зняв GAIN 6 dB (3V3); ривки мали дві програмні причини (UART‑дамп TTS удвічі повільніший за real‑time + відсутній jitter‑буфер у плеєрі) — виправлено. Лишилось: закомітити зміни TuyaOpen (без `tuya_config.h`) і зібрати «чисту» прошивку.**
+**2026-09-30 (стабільна): «Hi Lexin» → LISTEN → діалог → follow-up працює без кнопки; причиною мовчання WakeNet була орієнтація INMP441 (порт у стіл), софт‑фікси — HPF 180 Hz, KWS gain 2.0, стек 6144; діагностика вимкнена; коміти TuyaOpen `760d198a`, platform/ESP32 `29eb874`, патчі в `patches/*2026-09-30.patch`. Далі — корпус і спостереження за false‑wake.**
